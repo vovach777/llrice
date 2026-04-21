@@ -18,9 +18,12 @@
 #include "image.hpp"
 
 //#define USE_SIMPLE_RLGR
-#define ONE_CODER
-//#define USE_RLGR3
-#define USE_NEW_LINE
+#define CODER_GRB    0
+#define CODER_G_RB   1
+#define CODER_G_RB_SUM 2
+#define CODER_G_R_B 3
+#define CODER CODER_G_RB
+//#define USE_NEW_LINE
 namespace llrice
 {
     constexpr inline auto ext = ".llr";
@@ -90,19 +93,18 @@ namespace llrice
         using Encoder = RLGR::Encoder;
 #endif
 
-    #ifdef ONE_CODER
-            Encoder g_encoder(out_pool);
-            Encoder rb_encoder(out_pool);
-        #ifdef USE_RLGR3
-            BitStream::Writer r_encoder(out_pool);
+        Encoder g_encoder(out_pool);
+        #if CODER == CODER_G_RB  ||  CODER == CODER_G_RB_SUM
+        Encoder rb_encoder(out_pool);
         #endif
-    #else
-        std::array<Encoder,3> encoders{
-            Encoder(out_pool),
-            Encoder(out_pool),
-            Encoder(out_pool)
-        };
-    #endif
+        #if CODER == CODER_G_RB_SUM
+            BitStream::Writer rem_encoder(out_pool);
+        #endif
+        #if CODER == CODER_G_R_B
+            Encoder r_encoder(out_pool);
+            Encoder b_encoder(out_pool);
+        #endif
+
 
         // uint16_t Rshift = std::max(0, hdr.channels_depth - 8);
         // uint16_t Rmask = (1 << Rshift) - 1;
@@ -120,54 +122,58 @@ namespace llrice
                     curr_line[w+0] = r;
                     curr_line[w+1] = g;
                     curr_line[w+2] = b;
-                    auto v0 = Rice::to_unsigned( r - predict(w+0,h,curr_line, prev_line) );
-                    auto v1 = Rice::to_unsigned( g - predict(w+1,h,curr_line, prev_line) );
-                    auto v2 = Rice::to_unsigned( b - predict(w+2,h,curr_line, prev_line) );
-                    #ifdef ONE_CODER
-                        g_encoder.put( v1 ); //g is luma
-                        #ifdef USE_RLGR3
-                            auto rb = v0 + v2;    //rb is chroma
-                            rb_encoder.put( rb );
-                            if (unlikely(rb != 0)) {
-                                auto k_rem = std20::bit_width( rb );
-                                r_encoder.reserve( k_rem );
-                                r_encoder.put_bits( k_rem, v0 );
-                            }
-                        #else
-                            rb_encoder.put( v0 );
-                            rb_encoder.put( v2 );
-                        #endif
-
-                    #else
-                        encoders[0].put( v0 );
-                        encoders[1].put( v1 );
-                        encoders[2].put( v2 );
+                    auto r_rem = Rice::to_unsigned( r - predict(w+0,h,curr_line, prev_line) );
+                    auto g_rem = Rice::to_unsigned( g - predict(w+1,h,curr_line, prev_line) );
+                    auto b_rem = Rice::to_unsigned( b - predict(w+2,h,curr_line, prev_line) );
+                    g_encoder.put( g_rem ); //g is luma
+                    #if CODER == CODER_GRB
+                       g_encoder.put( r_rem );
+                       g_encoder.put( b_rem );
+                    #endif
+                    #if CODER == CODER_G_RB
+                        rb_encoder.put( r_rem );
+                        rb_encoder.put( b_rem );
                     #endif
 
+                    #if CODER == CODER_G_RB_SUM
+                        auto rb = r_rem + b_rem;    //rb is chroma
+                        rb_encoder.put( rb );
+                        if (unlikely(rb != 0)) {
+                            auto rb_width = std20::bit_width( rb );
+                            rem_encoder.reserve( rb_width );
+                            rem_encoder.put_bits( rb_width, r_rem );
+                        }
+                    #endif
+
+                    #if CODER == CODER_G_R_B
+                       r_encoder.put( r_rem );
+                       b_encoder.put( b_rem );
+                    #endif
             }
         #ifdef USE_NEW_LINE
-            #ifdef ONE_CODER
-                g_encoder.new_line();
+            g_encoder.new_line();
+            #if CODER == CODER_G_RB || CODER == CODER_G_RB_SUM
                 rb_encoder.new_line();
-            #else
-                encoders[0].new_line();
-                encoders[1].new_line();
-                encoders[2].new_line();
+            #endif
+            #if CODER == CODER_G_R_B
+                r_encoder.new_line();
+                b_encoder.new_line();
             #endif
         #endif
 
         }
-#ifdef ONE_CODER
         g_encoder.flush();
-        rb_encoder.flush();
-    #ifdef USE_RLGR3
-        r_encoder.flush();
-    #endif
-#else
-        for (int i = 0; i < 3; ++i) {
-            encoders[i].flush();
-        }
-#endif
+        #if CODER == CODER_G_RB || CODER == CODER_G_RB_SUM
+            rb_encoder.flush();
+        #endif
+        #if CODER == CODER_G_RB_SUM
+            rem_encoder.flush();
+        #endif
+        #if CODER == CODER_G_R_B
+            r_encoder.flush();
+            b_encoder.flush();
+        #endif
+
         return out_pool.move();
     }
 
@@ -211,69 +217,69 @@ namespace llrice
         using Decoder = RLGR::Decoder;
 #endif
 
-#ifdef ONE_CODER
-        Decoder g_decoder(pool);
-        Decoder rb_decoder(pool);
-    #ifdef USE_RLGR3
-        BitStream::Reader r_decoder(pool);
+
+    Decoder g_decoder(pool);
+    #if  CODER == CODER_G_RB || CODER == CODER_G_RB_SUM
+    Decoder rb_decoder(pool);
     #endif
-#else
-        std::array<Decoder,3> decoders{
-            Decoder(pool),
-            Decoder(pool),
-            Decoder(pool)
-        };
-#endif
+    #if CODER == CODER_G_RB_SUM
+        BitStream::Reader rem_bs(pool);
+    #endif
+
+    #if CODER == CODER_G_R_B
+        Decoder r_decoder(pool);
+        Decoder b_decoder(pool);
+    #endif
+
         int clamp = (1 << img.bits_per_channel)-1;
         auto core = [&](auto store) {
         for (uint32_t h = 0; h < height; ++h) {
             auto curr_line = line[h & 1];
             auto prev_line = line[(h-1) & 1];
             for (uint32_t w = 0; w < width*4; w+=4) {
-                #ifdef ONE_CODER
-                    int16_t v0{0};
-                    int16_t v1 = Rice::to_signed( g_decoder.get() );
-                    int16_t v2{0};
-                    #ifdef USE_RLGR3
-                        auto rb = rb_decoder.get();
-                        if (unlikely(rb != 0)) {
-                            auto r_rem = std20::bit_width(rb);
-                            r_decoder.reserve(r_rem);
-                            auto r = r_decoder.peek_n(r_rem);
-                            r_decoder.skip(r_rem);
-                            v0 = Rice::to_signed( r );
-                            v2 = Rice::to_signed( rb - r );
-                        }
-                    #else
-                        v0 = Rice::to_signed( rb_decoder.get() );
-                        v2 = Rice::to_signed( rb_decoder.get() );
-
-                    #endif
-
-                #else
-                    int16_t v0 = Rice::to_signed( decoders[0].get() );
-                    int16_t v1 = Rice::to_signed( decoders[1].get() );
-                    int16_t v2 = Rice::to_signed( decoders[2].get() );
+                int g = Rice::to_signed( g_decoder.get() );
+                #if CODER == CODER_G_R_B
+                   int r = Rice::to_signed( r_decoder.get() );
+                   int b = Rice::to_signed( b_decoder.get() );
                 #endif
-                v0 += predict(w + 0,h,curr_line,prev_line);
-                v1 += predict(w + 1,h,curr_line,prev_line);
-                v2 += predict(w + 2,h,curr_line,prev_line);
-                auto r = curr_line[w+0] = v0;
-                auto g = curr_line[w+1] = v1;
-                auto b = curr_line[w+2] = v2;
+                #if CODER == CODER_GRB
+                   int r = Rice::to_signed( g_decoder.get() );
+                   int b = Rice::to_signed( g_decoder.get() );
+                #endif
+                #if CODER == CODER_G_RB
+                    int r = Rice::to_signed( rb_decoder.get() );
+                    int b = Rice::to_signed( rb_decoder.get() );
+                #endif
+                #if CODER == CODER_G_RB_SUM
+                    int r{0};
+                    int b{0};
+                    auto rb = rb_decoder.get();
+                    if (unlikely(rb != 0)) {
+                        auto rb_width = std20::bit_width(rb);
+                        rem_bs.reserve(rb_width);
+                        auto r_unsigned = rem_bs.peek_n(rb_width);
+                        rem_bs.skip(rb_width);
+                        r = Rice::to_signed( r_unsigned );
+                        b = Rice::to_signed( rb - r_unsigned );
+                    }
+                #endif
+                curr_line[w+0] = r += predict(w + 0,h,curr_line,prev_line);
+                curr_line[w+1] = g += predict(w + 1,h,curr_line,prev_line);
+                curr_line[w+2] = b += predict(w + 2,h,curr_line,prev_line);
                 g -= (r + b) >> 2;
                 r += g;
                 b += g;
                 store(r,g,b);
             }
         #ifdef USE_NEW_LINE
-            #ifdef ONE_CODER
-                g_decoder.new_line();
+            g_decoder.new_line();
+            #if CODER == CODER_G_RB || CODER == CODER_G_RB_SUM
                 rb_decoder.new_line();
-            #else
-                decoders[0].new_line();
-                decoders[1].new_line();
-                decoders[2].new_line();
+            #endif
+
+            #if CODER == CODER_G_R_B
+                r_decoder.new_line();
+                b_decoder.new_line();
             #endif
         #endif
         }

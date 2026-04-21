@@ -24,14 +24,20 @@ struct RingArray {
         size_--;
 
         return val;
-                
+
     }
 
     constexpr T peek() const {
          assert(!empty());
         auto val = buf_[tail_];
         return val;
-                
+
+    }
+
+    constexpr T& peek() {
+         assert(!empty());
+        return buf_[tail_];
+
     }
 
     constexpr uint32_t size() const {
@@ -47,6 +53,6 @@ struct RingArray {
     uint32_t head_ = 0;
     uint32_t tail_ = 0;
     uint32_t size_ = 0;
-    
+
 };
 

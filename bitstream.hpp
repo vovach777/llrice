@@ -74,6 +74,121 @@ namespace BitStream {
 
     };
 
+    /*
+
+    The first implementation employs a lazy reading pattern, deferring heavy operations until strictly necessary (within the refill method).
+    In contrast, the second implementation aggressively attempts to maintain a ready 32-bit lookahead window on every skip invocation,
+    incurring substantial computational overhead that ultimately bottlenecks the parser.
+
+    */
+
+#ifndef SLOW_READER
+    struct alignas(32) Reader
+    {
+        uint64_t buf64{0}; // stores bits read from the buffer
+        // uint32_t buf32{0};
+        uint32_t bits_valid{0}; // number of bits left in bits field
+        int32_t total_buffered{0};  // cnt32 + cnt64 + res.size()*64
+        uint32_t rdy_peek{0};
+        RingArray<uint64_t,4> res;
+        const PagePool& pool;
+
+        Reader(const PagePool& pool) : pool(pool) {
+        }
+
+        inline uint32_t get_total_buffered() const {
+            return bits_valid + (res.size() * 64) - rdy_peek;
+        }
+
+        void reserve(uint32_t count) {
+            assert(count > 0);
+            while (total_buffered < count)  {
+                res.put( pool.get_next_read_page() );
+                total_buffered += 64;
+            }
+        }
+
+        inline void skip(uint32_t n)
+        {
+            assert(bits_valid >= n);
+            buf64 <<=  n;
+            bits_valid -= n;
+            total_buffered -=n;
+        }
+#if 1
+        void refill(uint32_t count) {
+
+            while (bits_valid < count) {
+                auto take = std::min(64 - bits_valid, 64 - rdy_peek);
+                if (take == 0) {
+                    assert(res.size() > 0);
+                    res.get();
+                    rdy_peek = 0;
+                    continue;
+                }
+                assert(res.size() > 0);
+                buf64 |= (res.peek() >> bits_valid);
+                bits_valid += take;
+                if (take < 64) {
+                    res.peek() <<= take;
+                } else {
+                    res.peek() = 0;
+                }
+                rdy_peek += take;
+            }
+        }
+#else
+        uint64_t cur = 0;
+        uint32_t cur_bits = 0;
+
+        inline void refill(uint32_t count)
+        {
+            while (bits_valid < count)
+            {
+                if (cur_bits == 0) {
+                    assert(res.size() > 0);
+                    cur = res.get();
+                    cur_bits = 64;
+                }
+
+                uint32_t space = 64 - bits_valid;
+                uint32_t take  = (cur_bits < space) ? cur_bits : space;
+
+                // берём старшие take бит из cur
+                uint64_t chunk = cur >> (64 - take);
+
+                // кладём их сразу за уже имеющимися bits_valid битами в buf64
+                buf64 |= chunk << (64 - bits_valid - take);
+
+                cur      <<= take;
+                cur_bits -= take;
+                bits_valid += take;
+            }
+        }
+
+#endif
+        inline uint32_t peek32()
+        {
+            if ((bits_valid < 32)) {
+                refill(32);
+            }
+            assert(bits_valid >= 32);
+            return buf64 >> 32;
+
+
+        }
+        inline uint32_t peek_n(uint32_t n)
+        {
+            assert(n != 0);
+            assert(n <= 32);
+            if (bits_valid < n) {
+                refill(n);
+            }
+            assert(bits_valid >= n);
+            return buf64 >> (64-n);
+        }
+    };
+#else
     struct alignas(32) Reader
     {
         uint64_t buf64{0}; // stores bits read from the buffer
@@ -177,6 +292,7 @@ namespace BitStream {
             return n == 32 ? buf32 : (buf32 >> (32-n));
         }
     };
+#endif
 
 }
 
