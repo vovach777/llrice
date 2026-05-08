@@ -1,5 +1,21 @@
 #pragma once
 #include <cstdint>
+#include <limits>
+#include <type_traits>
+
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    #include <nmmintrin.h>
+    inline uint32_t crc32_u8(uint32_t crc, uint8_t val) { return _mm_crc32_u8(crc, val); }
+    inline uint32_t crc32_u16(uint32_t crc, uint16_t val) { return _mm_crc32_u16(crc, val); }
+    inline uint32_t crc32_u32(uint32_t crc, uint32_t val) { return _mm_crc32_u32(crc, val); }
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    #include <arm_acle.h>
+    inline uint32_t crc32_u8(uint32_t crc, uint8_t val) { return __crc32cb(crc, val); }
+    inline uint32_t crc32_u16(uint32_t crc, uint16_t val) { return __crc32ch(crc, val); }
+    inline uint32_t crc32_u32(uint32_t crc, uint32_t val) { return __crc32cw(crc, val); }
+#else
+    #error "Hardware CRC32 is not supported on this platform"
+#endif
 
 namespace std20 {
     template <class T>

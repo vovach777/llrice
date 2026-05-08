@@ -46,18 +46,18 @@ namespace llrice
         uint8_t  channel_nb;    // r,g,b,n1,n2,n3,n4...
         uint8_t  channels_depth; // 8-16 supported: 8-15 -> int16_t arithmetic coding, 16 -> int32_t arithmetic coding, >16 is not tested
         void protect() {
-            hdr_crc = _mm_crc32_u32(signature,width);
-            hdr_crc = _mm_crc32_u32(hdr_crc, height);
-            hdr_crc = _mm_crc32_u16(hdr_crc, flags);
-            hdr_crc = _mm_crc32_u8(hdr_crc, channel_nb);
-            hdr_crc = _mm_crc32_u8(hdr_crc, channels_depth);
+            hdr_crc = crc32_u32(signature, width);
+            hdr_crc = crc32_u32(hdr_crc, height);
+            hdr_crc = crc32_u16(hdr_crc, flags);
+            hdr_crc = crc32_u8(hdr_crc, channel_nb);
+            hdr_crc = crc32_u8(hdr_crc, channels_depth);
         }
         bool check()  {
-            auto crc = _mm_crc32_u32(signature,width);
-            crc = _mm_crc32_u32(crc, height);
-            crc = _mm_crc32_u16(crc, flags);
-            crc = _mm_crc32_u8(crc, channel_nb);
-            crc = _mm_crc32_u8(crc, channels_depth);
+            auto crc = crc32_u32(signature, width);
+            crc = crc32_u32(crc, height);
+            crc = crc32_u16(crc, flags);
+            crc = crc32_u8(crc, channel_nb);
+            crc = crc32_u8(crc, channels_depth);
             return crc == hdr_crc;
         }
     };
