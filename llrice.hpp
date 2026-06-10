@@ -17,6 +17,7 @@
 #include "rlgr.hpp"
 #include "image.hpp"
 
+//#define USE_YCoCg
 //#define USE_SIMPLE_RLGR
 #define CODER_GRB    0
 #define CODER_G_RB   1
@@ -115,10 +116,21 @@ namespace llrice
             auto prev_line = line[(h-1) & 1];
             for (uint32_t w = 0; w < width*4; w+=4) {
                     auto [r,g,b] = rgbloader();
+                    #ifdef USE_YCoCg
+                    {
+                    int Co = r - b;
+                    int tmp = b + (Co >> 1);
+                    int Cg = g - tmp;
+                    int Y  = tmp + (Cg >> 1);
+                    r = Co;
+                    b = Cg;
+                    g = Y;
+                    }
+                    #else
                     b -= g;
                     r -= g;
                     g += (b + r) >> 2;
-
+                    #endif
                     curr_line[w+0] = r;
                     curr_line[w+1] = g;
                     curr_line[w+2] = b;
@@ -266,9 +278,21 @@ namespace llrice
                 curr_line[w+0] = r += predict(w + 0,h,curr_line,prev_line);
                 curr_line[w+1] = g += predict(w + 1,h,curr_line,prev_line);
                 curr_line[w+2] = b += predict(w + 2,h,curr_line,prev_line);
+                #ifdef USE_YCoCg
+                {
+                    int Y = g;
+                    int Co = r;
+                    int Cg = b;
+                    int tmp = Y - (Cg>>1);
+                    g  = Cg + tmp;
+                    b = tmp - (Co>>1);
+                    r = b + Co;
+                }
+                #else
                 g -= (r + b) >> 2;
                 r += g;
                 b += g;
+                #endif
                 store(r,g,b);
             }
         #ifdef USE_NEW_LINE

@@ -28,7 +28,7 @@
 
                 if ( channel_type == ChannelType::uint8 )
                     size = (size + 1) / 2;
-                data = std::make_unique<uint16_t[]>( size );
+		        data = std::unique_ptr<uint16_t[]>(new uint16_t[size]);
             }
         }
 
