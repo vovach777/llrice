@@ -23,7 +23,7 @@
 #define CODER_G_RB   1
 #define CODER_G_RB_SUM 2
 #define CODER_G_R_B 3
-#define CODER CODER_G_RB
+#define CODER CODER_G_R_B
 //#define USE_NEW_LINE
 namespace llrice
 {
@@ -65,28 +65,49 @@ namespace llrice
 
 
     template <typename T>
-    inline auto predict(uint32_t w, uint32_t h, const T* curr_row, const T* prev_row) {
-        const T l = w >= 4 ? curr_row[w - 4] : h > 0 ? prev_row[w] : 0;
-        const T t = h > 0 ? prev_row[w] : l;
-        const T tl = h > 0 && w >= 4 ? prev_row[w-4] : t;
+    inline auto predict(T l, T t, T tl) {
         return median<T>(l, l + t - tl, t);
     }
 
-    template <typename RGBLoader>
-    auto rlgr_encode(const Header& hdr, RGBLoader && rgbloader)
+
+#ifdef __clang__
+typedef int16_t v4i16 __attribute__((ext_vector_type(4)));
+typedef int16_t v4i32 __attribute__((ext_vector_type(4)));
+#else
+typedef int16_t v4i16 __attribute__ ((vector_size (4 * sizeof(int16_t))));
+typedef int16_t v4i32 __attribute__ ((vector_size (4 * sizeof(int32_t))));
+#endif
+
+template <typename Load>
+void LOCO_I(Load && load, size_t width, size_t height) {
+    using Int = std::remove_cvref_t<decltype(load())>;
+    auto up_line = std::vector(width,Int{});
+    for (int h=0;h<height; ++h) {
+        auto left = up_line[0];
+        auto ptop = up_line[0];
+        for (int x=0;x<width;  ++x) {
+            Int top  = up_line[x];
+            auto cur = up_line[x] = Load( median(top,left,Int( top + left - ptop)), x,h );
+            ptop =  top;
+            left = up_line[x] = cur;
+        }
+    }
+}
+
+
+
+    template <typename T, typename RGBLoader>
+    auto rlgr_encode(PagePool& out_pool, uint32_t width, uint32_t height, RGBLoader && rgbloader)
     {
-        const auto width = hdr.width;
-        const auto height = hdr.height;
-        std::vector<int16_t> lines( 2*4*width );
-        int16_t* line[2] {
-            lines.data(),
-            lines.data() + width*4
-        };
-        PagePool out_pool;
-        out_pool.reserve(hdr.width*hdr.height);
-        out_pool.acquire_page(); //для заголовка
-        out_pool.acquire_page();
-        std::memcpy(&(out_pool[0]), &hdr, sizeof(Header));
+        uint32_t stride = width;
+        std::vector<T> lines_storage(width * 3 * 2);
+        std::array<std::array<T*,3>,2> lines
+            {
+                std::array{lines_storage.data(),lines_storage.data()+stride,lines_storage.data()+stride*2},
+                std::array{lines_storage.data()+stride*3,lines_storage.data()+stride*4,lines_storage.data()+stride*5},
+
+            };
+
 
 #ifdef USE_SIMPLE_RLGR
         using Encoder = RLGR::Simple::Encoder;
@@ -110,58 +131,146 @@ namespace llrice
         // uint16_t Rshift = std::max(0, hdr.channels_depth - 8);
         // uint16_t Rmask = (1 << Rshift) - 1;
 
+        // auto quant3 = [](auto v) {
+        //     return -(v < -4) + (v > 4);
+        // };
+
+
+        uint32_t rem[3][16];
 
         for (uint32_t h = 0; h < height; ++h) {
-            auto curr_line = line[h & 1];
-            auto prev_line = line[(h-1) & 1];
-            for (uint32_t w = 0; w < width*4; w+=4) {
-                    auto [r,g,b] = rgbloader();
-                    #ifdef USE_YCoCg
-                    {
-                    int Co = r - b;
-                    int tmp = b + (Co >> 1);
-                    int Cg = g - tmp;
-                    int Y  = tmp + (Cg >> 1);
-                    r = Co;
-                    b = Cg;
-                    g = Y;
+            auto& curr_line = lines[h & 1];
+            auto& prev_line = lines[(h-1) & 1];
+            auto width16 =width & ~0xfu;
+            auto widthR  =width & 0xfu;
+            for (uint32_t w = 0; w < width16; w+=16) {
+
+                    for (int i = 0; i <16; ++i) {
+                        std::tie(curr_line[0][i+w],curr_line[1][i+w],curr_line[2][i+w]) = rgbloader();
                     }
-                    #else
-                    b -= g;
-                    r -= g;
-                    g += (b + r) >> 2;
-                    #endif
-                    curr_line[w+0] = r;
-                    curr_line[w+1] = g;
-                    curr_line[w+2] = b;
-                    auto r_rem = Rice::to_unsigned( r - predict(w+0,h,curr_line, prev_line) );
-                    auto g_rem = Rice::to_unsigned( g - predict(w+1,h,curr_line, prev_line) );
-                    auto b_rem = Rice::to_unsigned( b - predict(w+2,h,curr_line, prev_line) );
-                    g_encoder.put( g_rem ); //g is luma
-                    #if CODER == CODER_GRB
-                       g_encoder.put( r_rem );
-                       g_encoder.put( b_rem );
-                    #endif
-                    #if CODER == CODER_G_RB
-                        rb_encoder.put( r_rem );
-                        rb_encoder.put( b_rem );
-                    #endif
+                    for (int i = 0; i <16; ++i) {
+                        curr_line[0][i+w] -= curr_line[1][i+w];
+                        curr_line[2][i+w] -= curr_line[1][i+w];
+                        curr_line[1][i+w] += (curr_line[0][i+w] + curr_line[2][i+w]) >> 2;
+                    }
 
-                    #if CODER == CODER_G_RB_SUM
-                        auto rb = r_rem + b_rem;    //rb is chroma
-                        rb_encoder.put( rb );
-                        if (unlikely(rb != 0)) {
-                            auto rb_width = std20::bit_width( rb );
-                            rem_encoder.reserve( rb_width );
-                            rem_encoder.put_bits( rb_width, r_rem );
+                    if (likely(w>0 && h>0)) {
+                        for (int i = 0; i <16; ++i) {
+                            //predict(T l, T t, T tl) {
+                            for (int c = 0; c < 3; ++c) {
+                               rem[c][i] = Rice::to_unsigned(curr_line[c][w+i] - predict( curr_line[c][w+i-1], prev_line[c][w+i], prev_line[c][w+i-1] ));
+                            }
                         }
-                    #endif
+                    } else
+                    if (h==0) {
+                        for (int i = 0; i <16; ++i) {
+                            for (int c = 0; c < 3; ++c) {
+                               rem[c][i] = Rice::to_unsigned( curr_line[c][w+i] - (w+i ? curr_line[c][w+i-1] : 0 ) );
+                            }
+                        }
+                    } else {
+                        for (int i = 0; i <16; ++i) {
+                            for (int c = 0; c < 3; ++c) {
+                               rem[c][i] = Rice::to_unsigned( curr_line[c][w+i] - prev_line[c][w+i] );
+                            }
+                        }
+                    }
+                    for (int i = 0; i < 16; ++i) {
+                        auto& r_rem = rem[0][i];
+                        auto& g_rem = rem[1][i];
+                        auto& b_rem = rem[2][i];
 
-                    #if CODER == CODER_G_R_B
-                       r_encoder.put( r_rem );
-                       b_encoder.put( b_rem );
-                    #endif
+                        g_encoder.put( g_rem ); //g is luma
+                        #if CODER == CODER_GRB
+                        g_encoder.put( r_rem );
+                        g_encoder.put( b_rem );
+                        #endif
+                        #if CODER == CODER_G_RB
+                            rb_encoder.put( r_rem );
+                            rb_encoder.put( b_rem );
+                        #endif
+
+                        #if CODER == CODER_G_RB_SUM
+                            auto rb = r_rem + b_rem;    //rb is chroma
+                            rb_encoder.put( rb );
+                            if (unlikely(rb != 0)) {
+                                auto rb_width = std20::bit_width( rb );
+                                rem_encoder.reserve( rb_width );
+                                rem_encoder.put_bits( rb_width, r_rem );
+                            }
+                        #endif
+
+                        #if CODER == CODER_G_R_B
+                        r_encoder.put( r_rem );
+                        b_encoder.put( b_rem );
+                        #endif
+                    }
             }
+            if ( widthR > 0) {
+                auto w = width16;
+
+                    for (int i = 0; i < widthR; ++i) {
+                        std::tie(curr_line[0][i+w],curr_line[1][i+w],curr_line[2][i+w]) = rgbloader();
+                    }
+                    for (int i = 0; i < widthR; ++i) {
+                        curr_line[0][i+w] -= curr_line[1][i+w];
+                        curr_line[2][i+w] -= curr_line[1][i+w];
+                        curr_line[1][i+w] += (curr_line[0][i+w] + curr_line[2][i+w]) >> 2;
+                    }
+
+                    if (likely(w>0 && h>0)) {
+                        for (int i = 0; i < widthR; ++i) {
+                            //predict(T l, T t, T tl) {
+                            for (int c = 0; c < 3; ++c) {
+                               rem[c][i] = Rice::to_unsigned(curr_line[c][w+i] - predict( curr_line[c][w+i-1], prev_line[c][w+i], prev_line[c][w+i-1] ));
+                            }
+                        }
+                    } else
+                    if (h==0) {
+                        for (int i = 0; i < widthR; ++i) {
+                            for (int c = 0; c < 3; ++c) {
+                               rem[c][i] = Rice::to_unsigned( curr_line[c][w+i] - (w+i ? curr_line[c][w+i-1] : 0 ) );
+                            }
+                        }
+                    } else {
+                        for (int i = 0; i < widthR; ++i) {
+                            for (int c = 0; c < 3; ++c) {
+                               rem[c][i] = Rice::to_unsigned( curr_line[c][w+i] - prev_line[c][w+i] );
+                            }
+                        }
+                    }
+                    for (int i = 0; i < widthR; ++i) {
+                        auto& r_rem = rem[0][i];
+                        auto& g_rem = rem[1][i];
+                        auto& b_rem = rem[2][i];
+
+                        g_encoder.put( g_rem ); //g is luma
+                        #if CODER == CODER_GRB
+                        g_encoder.put( r_rem );
+                        g_encoder.put( b_rem );
+                        #endif
+                        #if CODER == CODER_G_RB
+                            rb_encoder.put( r_rem );
+                            rb_encoder.put( b_rem );
+                        #endif
+
+                        #if CODER == CODER_G_RB_SUM
+                            auto rb = r_rem + b_rem;    //rb is chroma
+                            rb_encoder.put( rb );
+                            if (unlikely(rb != 0)) {
+                                auto rb_width = std20::bit_width( rb );
+                                rem_encoder.reserve( rb_width );
+                                rem_encoder.put_bits( rb_width, r_rem );
+                            }
+                        #endif
+
+                        #if CODER == CODER_G_R_B
+                        r_encoder.put( r_rem );
+                        b_encoder.put( b_rem );
+                        #endif
+                    }
+            }
+
         #ifdef USE_NEW_LINE
             g_encoder.new_line();
             #if CODER == CODER_G_RB || CODER == CODER_G_RB_SUM
@@ -190,8 +299,228 @@ namespace llrice
     }
 
 
+    template <typename UT, typename T, typename Store>
+    inline void rlgr_decode(PagePool& pool, Store && store,  uint32_t width, uint32_t height)
+    {
+        std::array<std::array<std::vector<T>,3>,2> lines
+            {
+                std::array{std::vector<T>(width),std::vector<T>(width),std::vector<T>(width)},
+                std::array{std::vector<T>(width),std::vector<T>(width),std::vector<T>(width)}
+            };
+        using Stream = BitStream::Reader;
+#ifdef USE_SIMPLE_RLGR
+        using Decoder = RLGR::Simple::Decoder;
+#else
+        using Decoder = RLGR::Decoder;
+#endif
+        Decoder g_decoder(pool);
+        #if  CODER == CODER_G_RB || CODER == CODER_G_RB_SUM
+        Decoder rb_decoder(pool);
+        #endif
+        #if CODER == CODER_G_RB_SUM
+            BitStream::Reader rem_bs(pool);
+        #endif
 
-    inline auto rlgr_decode(std::vector<uint64_t> & poolvec)
+        #if CODER == CODER_G_R_B
+            Decoder r_decoder(pool);
+            Decoder b_decoder(pool);
+        #endif
+
+        uint32_t rem[3][16];
+
+        for (uint32_t h = 0; h < height; ++h) {
+            auto& curr_line = lines[h & 1];
+            auto& prev_line = lines[(h-1) & 1];
+            auto width16 =width & ~0xfu;
+            auto widthR  =width & 0xfu;
+
+            for (uint32_t w = 0; w < width16; w+=16) {
+                for (int i = 0; i <16; ++i) {
+                auto& r = rem[0][i];
+                auto& g = rem[1][i];
+                auto& b = rem[2][i];
+
+                g = g_decoder.get();
+                #if CODER == CODER_G_R_B
+                    r = r_decoder.get();
+                    b = b_decoder.get();
+                #endif
+                #if CODER == CODER_GRB
+                    r = g_decoder.get();
+                    b = g_decoder.get();
+                #endif
+                #if CODER == CODER_G_RB
+                    r = rb_decoder.get();
+                    b = rb_decoder.get();
+                #endif
+                #if CODER == CODER_G_RB_SUM
+                    r = 0;
+                    b = 0;
+                    uint32_t rb = rb_decoder.get();
+                    if (unlikely(rb != 0)) {
+                        auto rb_width = std20::bit_width(rb);
+                        rem_bs.reserve(rb_width);
+                        auto r_unsigned = rem_bs.peek_n(rb_width);
+                        rem_bs.skip(rb_width);
+                        r = r_unsigned;
+                        b = rb - r_unsigned;
+                    }
+                #endif
+                }
+
+                    if (likely(w>0 && h>0)) {
+                        for (int i = 0; i <16; ++i) {
+                            //predict(T l, T t, T tl) {
+                            for (int c = 0; c < 3; ++c) {
+                               curr_line[c][w+i] =  Rice::to_signed(rem[c][i]) +  predict( curr_line[c][w+i-1], prev_line[c][w+i], prev_line[c][w+i-1]);
+                            }
+                        }
+                    } else
+                    if (h==0) {
+                        for (int i = 0; i <16; ++i) {
+                            for (int c = 0; c < 3; ++c) {
+                               curr_line[c][w+i] = Rice::to_signed(rem[c][i])  + (w+i ? curr_line[c][w+i-1] : 0 );
+                            }
+                        }
+                    } else {
+                        for (int i = 0; i <16; ++i) {
+                            for (int c = 0; c < 3; ++c) {
+                               curr_line[c][w+i] = Rice::to_signed(rem[c][i])  + prev_line[c][w+i];
+                            }
+                        }
+                    }
+                    for (int i = 0; i <16; ++i) {
+                        T r = curr_line[0][w+i];
+                        T g = curr_line[1][w+i];
+                        T b = curr_line[2][w+i];
+                        g -= (r+b) >> 2;
+                        r += g;
+                        b += g;
+                        store(static_cast<UT>(r),static_cast<UT>(g),static_cast<UT>(b));
+                    }
+            }
+
+            if ( widthR > 0) {
+                auto w = width16;
+                for (int i = 0; i < widthR; ++i) {
+                auto& r = rem[0][i];
+                auto& g = rem[1][i];
+                auto& b = rem[2][i];
+
+                g = g_decoder.get();
+                #if CODER == CODER_G_R_B
+                    r = r_decoder.get();
+                    b = b_decoder.get();
+                #endif
+                #if CODER == CODER_GRB
+                    r = g_decoder.get();
+                    b = g_decoder.get();
+                #endif
+                #if CODER == CODER_G_RB
+                    r = rb_decoder.get();
+                    b = rb_decoder.get();
+                #endif
+                #if CODER == CODER_G_RB_SUM
+                    r = 0;
+                    b = 0;
+                    uint32_t rb = rb_decoder.get();
+                    if (unlikely(rb != 0)) {
+                        auto rb_width = std20::bit_width(rb);
+                        rem_bs.reserve(rb_width);
+                        auto r_unsigned = rem_bs.peek_n(rb_width);
+                        rem_bs.skip(rb_width);
+                        r = r_unsigned;
+                        b = rb - r_unsigned;
+                    }
+                #endif
+                }
+
+                    if (likely(w>0 && h>0)) {
+                        for (int i = 0; i < widthR; ++i) {
+                            //predict(T l, T t, T tl) {
+                            for (int c = 0; c < 3; ++c) {
+                               curr_line[c][w+i] =  Rice::to_signed(rem[c][i]) +  predict( curr_line[c][w+i-1], prev_line[c][w+i], prev_line[c][w+i-1]);
+                            }
+                        }
+                    } else
+                    if (h==0) {
+                        for (int i = 0; i < widthR; ++i) {
+                            for (int c = 0; c < 3; ++c) {
+                               curr_line[c][w+i] = Rice::to_signed(rem[c][i])  + (w+i ? curr_line[c][w+i-1] : 0 );
+                            }
+                        }
+                    } else {
+                        for (int i = 0; i < widthR; ++i) {
+                            for (int c = 0; c < 3; ++c) {
+                               curr_line[c][w+i] = Rice::to_signed(rem[c][i])  + prev_line[c][w+i];
+                            }
+                        }
+                    }
+                    for (int i = 0; i < widthR; ++i) {
+                        T r = curr_line[0][w+i];
+                        T g = curr_line[1][w+i];
+                        T b = curr_line[2][w+i];
+                        g -= (r+b) >> 2;
+                        r += g;
+                        b += g;
+                        store(static_cast<UT>(r),static_cast<UT>(g),static_cast<UT>(b));
+                    }
+            }
+
+        #ifdef USE_NEW_LINE
+            g_decoder.new_line();
+            #if CODER == CODER_G_RB || CODER == CODER_G_RB_SUM
+                rb_decoder.new_line();
+            #endif
+
+            #if CODER == CODER_G_R_B
+                r_decoder.new_line();
+                b_decoder.new_line();
+            #endif
+        #endif
+        }
+    }
+
+
+    inline auto compress(const RawImage& img)
+    {
+        Header hdr{0, img.width, img.height,static_cast<uint16_t>(1 << 15), img.channel_nb, img.bits_per_channel };
+        hdr.protect();
+        PagePool out_pool;
+        out_pool.reserve(hdr.width*hdr.height);
+        out_pool.acquire_page(); //для заголовка
+        out_pool.acquire_page();
+        std::memcpy(&(out_pool[0]), &hdr, sizeof(Header));
+
+        if ( img.channel_type == RawImage::ChannelType::uint16 ) {
+            auto pixels = img.as<uint16_t>();
+        //auto rlgr_encode(PagePool& out_pool, uint32_t width, uint32_t height, RGBLoader && rgbloader, FoldFunc && fold)
+
+            rlgr_encode<int32_t>(out_pool, hdr.width, hdr.height,[&]()
+            {
+                pixels += 3;
+                return std::make_tuple( pixels[-3], pixels[-2], pixels[-1]);
+            });
+        } else
+        if ( img.channel_type == RawImage::ChannelType::uint8 ) {
+            auto pixels = img.as<uint8_t>();
+            rlgr_encode<int16_t>(out_pool, hdr.width, hdr.height,[&]()
+            {
+                pixels += 3;
+                return std::make_tuple( pixels[-3], pixels[-2], pixels[-1]);
+            });
+        } else
+        throw std::runtime_error("Unsupported channel type");
+        return out_pool.move();
+    }
+
+
+    inline bool isLittleEndian() {
+        uint16_t num = 0x0001; // 1
+        return *(uint8_t*)&num == 0x01;
+    }
+
+    inline RawImage decompress(std::vector<uint64_t>& poolvec)
     {
         size_t rgb_pos = 0;
         Header hdr;
@@ -214,157 +543,34 @@ namespace llrice
         img.allocate();
         auto width = img.width;
         auto height = img.height;
-
-        std::vector<int16_t> lines( 2*4*width );
-        int16_t* line[2] {
-            lines.data(),
-            lines.data() + width*4
-        };
-
-        size_t count = size_t(width) * height * 3;
-        using Stream = BitStream::Reader;
-#ifdef USE_SIMPLE_RLGR
-        using Decoder = RLGR::Simple::Decoder;
-#else
-        using Decoder = RLGR::Decoder;
-#endif
-
-
-    Decoder g_decoder(pool);
-    #if  CODER == CODER_G_RB || CODER == CODER_G_RB_SUM
-    Decoder rb_decoder(pool);
-    #endif
-    #if CODER == CODER_G_RB_SUM
-        BitStream::Reader rem_bs(pool);
-    #endif
-
-    #if CODER == CODER_G_R_B
-        Decoder r_decoder(pool);
-        Decoder b_decoder(pool);
-    #endif
-
-        int clamp = (1 << img.bits_per_channel)-1;
-        auto core = [&](auto store) {
-        for (uint32_t h = 0; h < height; ++h) {
-            auto curr_line = line[h & 1];
-            auto prev_line = line[(h-1) & 1];
-            for (uint32_t w = 0; w < width*4; w+=4) {
-                int g = Rice::to_signed( g_decoder.get() );
-                #if CODER == CODER_G_R_B
-                   int r = Rice::to_signed( r_decoder.get() );
-                   int b = Rice::to_signed( b_decoder.get() );
-                #endif
-                #if CODER == CODER_GRB
-                   int r = Rice::to_signed( g_decoder.get() );
-                   int b = Rice::to_signed( g_decoder.get() );
-                #endif
-                #if CODER == CODER_G_RB
-                    int r = Rice::to_signed( rb_decoder.get() );
-                    int b = Rice::to_signed( rb_decoder.get() );
-                #endif
-                #if CODER == CODER_G_RB_SUM
-                    int r{0};
-                    int b{0};
-                    auto rb = rb_decoder.get();
-                    if (unlikely(rb != 0)) {
-                        auto rb_width = std20::bit_width(rb);
-                        rem_bs.reserve(rb_width);
-                        auto r_unsigned = rem_bs.peek_n(rb_width);
-                        rem_bs.skip(rb_width);
-                        r = Rice::to_signed( r_unsigned );
-                        b = Rice::to_signed( rb - r_unsigned );
-                    }
-                #endif
-                curr_line[w+0] = r += predict(w + 0,h,curr_line,prev_line);
-                curr_line[w+1] = g += predict(w + 1,h,curr_line,prev_line);
-                curr_line[w+2] = b += predict(w + 2,h,curr_line,prev_line);
-                #ifdef USE_YCoCg
-                {
-                    int Y = g;
-                    int Co = r;
-                    int Cg = b;
-                    int tmp = Y - (Cg>>1);
-                    g  = Cg + tmp;
-                    b = tmp - (Co>>1);
-                    r = b + Co;
-                }
-                #else
-                g -= (r + b) >> 2;
-                r += g;
-                b += g;
-                #endif
-                store(r,g,b);
-            }
-        #ifdef USE_NEW_LINE
-            g_decoder.new_line();
-            #if CODER == CODER_G_RB || CODER == CODER_G_RB_SUM
-                rb_decoder.new_line();
-            #endif
-
-            #if CODER == CODER_G_R_B
-                r_decoder.new_line();
-                b_decoder.new_line();
-            #endif
-        #endif
-        }
-        };//lambda
-        if (img.channel_type == RawImage::ChannelType::uint16) {
-            uint16_t* pixels16 = img.as<uint16_t>();
-            core([&](int16_t r, int16_t g, int16_t b) {
-                *pixels16++=r;
-                *pixels16++=g;
-                *pixels16++=b;
-            });
-        } else
-        if (img.channel_type == RawImage::ChannelType::uint16be) {
-            uint16_t* pixels16 = img.as<uint16_t>();
-            core([&](int16_t r, int16_t g, int16_t b) {
-                *pixels16++=bswap16(r);
-                *pixels16++=bswap16(g);
-                *pixels16++=bswap16(b);
-            });
-        } else {
-            assert( img.channel_type == RawImage::ChannelType::uint8 );
-            uint8_t* pixels8 = img.as<uint8_t>();
-            core([&](int8_t r, int8_t g, int8_t b) {
-                *pixels8++=r;
-                *pixels8++=g;
-                *pixels8++=b;
-            });
-        }
-        return img;
-    }
-
-
-
-    inline auto compressImage(const RawImage& img)
-    {
-        Header hdr{0, img.width, img.height,static_cast<uint16_t>(1 << 15), img.channel_nb, img.bits_per_channel };
-        hdr.protect();
         if ( img.channel_type == RawImage::ChannelType::uint16 ) {
-            auto pixels = img.as<uint16_t>();
-            return rlgr_encode(hdr, [&]()
-            {
-                pixels += 3;
-                return std::make_tuple( int(pixels[-3]), int(pixels[-2]), int(pixels[-1]));
-            });
+            auto rgb = img.as<uint16_t>();
+            if (isLittleEndian()) {
+                rlgr_decode<uint16_t,int32_t>(pool, [&](auto r, auto g, auto b) {
+                    rgb[rgb_pos++] = bswap16(r);
+                    rgb[rgb_pos++] = bswap16(g);
+                    rgb[rgb_pos++] = bswap16(b);
+                },  width, height);
+            } else {
+                rlgr_decode<uint16_t,int32_t>(pool, [&](auto r, auto g, auto b) {
+                    rgb[rgb_pos++] = r;
+                    rgb[rgb_pos++] = g;
+                    rgb[rgb_pos++] = b;
+                },  width, height);
+            }
         } else
         if ( img.channel_type == RawImage::ChannelType::uint8 ) {
-            auto pixels = img.as<uint8_t>();
-            return rlgr_encode(hdr, [&]()
-            {
-                pixels += 3;
-                return std::make_tuple( int16_t(pixels[-3]), int16_t(pixels[-2]), int16_t(pixels[-1]));
-            });
+            auto rgb = img.as<uint8_t>();
+            rlgr_decode<uint8_t,int16_t>(pool, [&](auto r, auto g, auto b) {
+                rgb[rgb_pos++] = r;
+                rgb[rgb_pos++] = g;
+                rgb[rgb_pos++] = b;
+            },  width, height);
+        }else
+        {
+            throw std::runtime_error("Unsupported channel type");
         }
-        throw std::runtime_error("Unsupported channel type");
-
-
-    }
-
-    inline RawImage decompressImage(std::vector<uint64_t>& poolvec)
-    {
-        return rlgr_decode(poolvec);
+        return img;
     }
 
 }

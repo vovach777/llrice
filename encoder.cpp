@@ -20,12 +20,11 @@ int main(int argc, char** argv) {
     try {
         const char* filename = argv[1];
         const char* outputFilename = argv[2];
-        std::vector<uint64_t> compressed;
         RawImage img;
         img.load(std::string(filename));
         img.le();
         execute_time.startnew();
-        compressed = llrice::compressImage(img );
+        auto compressed = llrice::compress(img);
 
         std::ofstream outFile(outputFilename, std::ios::binary);
         if (!outFile) {

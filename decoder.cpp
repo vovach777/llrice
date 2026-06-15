@@ -31,7 +31,7 @@ int main(int argc, char** argv) {
     inFile.close();
     try {
         execute_time.startnew();
-        auto rawImage = llrice::decompressImage(compressed);
+        auto rawImage = llrice::decompress(compressed);
         execute_time.stop();
         rawImage.save(std::string(outputFilename));
 

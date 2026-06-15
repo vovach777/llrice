@@ -1,13 +1,15 @@
 #pragma once
+//#define USE_MODEL_K
 #include <cstdint>
 #include <algorithm>
 #include <cassert>
 #include "ring.hpp"
 #include "pool.hpp"
+#ifdef USE_MODEL_K
 #include "model.hpp"
+#endif
 #include "bitstream.hpp"
 #include "rice.hpp"
-//#define USE_MODEL_K
 namespace RLGR {
     constexpr uint32_t MAX_K = 240;
     constexpr uint32_t UP_K = 5;   //original: 4
