@@ -24,7 +24,7 @@
 
         void allocate() {
             if (channel_type != ChannelType::none) {
-                size_t size = width * height * channel_nb;
+                size_t size = size_t(width) * height * channel_nb;
 
                 if ( channel_type == ChannelType::uint8 )
                     size = (size + 1) / 2;
@@ -112,7 +112,10 @@
                 channel_type = ChannelType::uint8;
             }
             allocate();
-            in.read(reinterpret_cast<char*>(data.get()),size);
+            in.read(reinterpret_cast<char*>(data.get()), size);
+            if (static_cast<size_t>(in.gcount()) < size) {
+                throw std::runtime_error("PPM data truncated");
+            }
         }
         inline void save( const std::string& filename ) {
             using ChannelType = RawImage::ChannelType;
