@@ -87,7 +87,7 @@ typedef int16_t v4i32 __attribute__ ((vector_size (4 * sizeof(int32_t))));
 
 template <typename Load>
 void LOCO_I(Load && load, size_t width, size_t height) {
-    using Int = std::remove_cvref_t<decltype(load())>;
+    using Int = std::remove_cv_t<std::remove_reference_t<decltype(load())>>;   // C++17 spelling of remove_cvref_t
     auto up_line = std::vector(width,Int{});
     for (int h=0;h<height; ++h) {
         auto left = up_line[0];
