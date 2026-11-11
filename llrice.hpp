@@ -23,7 +23,14 @@
 #define CODER_G_RB   1
 #define CODER_G_RB_SUM 2
 #define CODER_G_R_B 3
+#ifndef CODER
 #define CODER CODER_G_R_B
+#endif
+// CODER_G_RB_SUM: r in 0..rb (rb + 1 values). TRUNC_SPLIT 1: truncated binary, k = floor(log2(rb + 1)) bits if
+// r < u = 2^(k+1) - (rb + 1), else k + 1 bits of r + u (no code is wasted). 0: bit_width(rb) bits (old format).
+#ifndef TRUNC_SPLIT
+#define TRUNC_SPLIT 1
+#endif
 //#define USE_NEW_LINE
 namespace llrice
 {
@@ -194,9 +201,16 @@ void LOCO_I(Load && load, size_t width, size_t height) {
                             auto rb = r_rem + b_rem;    //rb is chroma
                             rb_encoder.put( rb );
                             if (unlikely(rb != 0)) {
+                            #if TRUNC_SPLIT
+                                const uint32_t tk = std20::bit_width( rb + 1 ) - 1, tu = (2u << tk) - (rb + 1);
+                                rem_encoder.reserve( tk + 1 );
+                                if ( r_rem < tu ) { if (tk) rem_encoder.put_bits( tk, r_rem ); }
+                                else rem_encoder.put_bits( tk + 1, r_rem + tu );
+                            #else
                                 auto rb_width = std20::bit_width( rb );
                                 rem_encoder.reserve( rb_width );
                                 rem_encoder.put_bits( rb_width, r_rem );
+                            #endif
                             }
                         #endif
 
@@ -258,9 +272,16 @@ void LOCO_I(Load && load, size_t width, size_t height) {
                             auto rb = r_rem + b_rem;    //rb is chroma
                             rb_encoder.put( rb );
                             if (unlikely(rb != 0)) {
+                            #if TRUNC_SPLIT
+                                const uint32_t tk = std20::bit_width( rb + 1 ) - 1, tu = (2u << tk) - (rb + 1);
+                                rem_encoder.reserve( tk + 1 );
+                                if ( r_rem < tu ) { if (tk) rem_encoder.put_bits( tk, r_rem ); }
+                                else rem_encoder.put_bits( tk + 1, r_rem + tu );
+                            #else
                                 auto rb_width = std20::bit_width( rb );
                                 rem_encoder.reserve( rb_width );
                                 rem_encoder.put_bits( rb_width, r_rem );
+                            #endif
                             }
                         #endif
 
@@ -358,10 +379,18 @@ void LOCO_I(Load && load, size_t width, size_t height) {
                     b = 0;
                     uint32_t rb = rb_decoder.get();
                     if (unlikely(rb != 0)) {
+                    #if TRUNC_SPLIT
+                        const uint32_t tk = std20::bit_width(rb + 1) - 1, tu = (2u << tk) - (rb + 1);
+                        rem_bs.reserve(tk + 1);
+                        uint32_t r_unsigned = 0;
+                        if (tk) { r_unsigned = rem_bs.peek_n(tk); rem_bs.skip(tk); }
+                        if (r_unsigned >= tu) { r_unsigned = ((r_unsigned << 1) | rem_bs.peek_n(1)) - tu; rem_bs.skip(1); }
+                    #else
                         auto rb_width = std20::bit_width(rb);
                         rem_bs.reserve(rb_width);
                         auto r_unsigned = rem_bs.peek_n(rb_width);
                         rem_bs.skip(rb_width);
+                    #endif
                         r = r_unsigned;
                         b = rb - r_unsigned;
                     }
@@ -425,10 +454,18 @@ void LOCO_I(Load && load, size_t width, size_t height) {
                     b = 0;
                     uint32_t rb = rb_decoder.get();
                     if (unlikely(rb != 0)) {
+                    #if TRUNC_SPLIT
+                        const uint32_t tk = std20::bit_width(rb + 1) - 1, tu = (2u << tk) - (rb + 1);
+                        rem_bs.reserve(tk + 1);
+                        uint32_t r_unsigned = 0;
+                        if (tk) { r_unsigned = rem_bs.peek_n(tk); rem_bs.skip(tk); }
+                        if (r_unsigned >= tu) { r_unsigned = ((r_unsigned << 1) | rem_bs.peek_n(1)) - tu; rem_bs.skip(1); }
+                    #else
                         auto rb_width = std20::bit_width(rb);
                         rem_bs.reserve(rb_width);
                         auto r_unsigned = rem_bs.peek_n(rb_width);
                         rem_bs.skip(rb_width);
+                    #endif
                         r = r_unsigned;
                         b = rb - r_unsigned;
                     }
