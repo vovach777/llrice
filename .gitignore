@@ -7,5 +7,5 @@
 !*.hpp
 !*.cpp
 !*.md
-!benchmark.py
-# !benchmark_work/
+!*.py
+!config.json
