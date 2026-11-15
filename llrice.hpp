@@ -20,8 +20,9 @@
 //   0 - the original RLGR / BitStream / PagePool classes;
 //   1 - rlgr_fast.hpp (default): lean page buffer, 4-entry page rings, Rice prefix by count-leading-ones, with the
 //       llrice reservation rule (RLGR_RESERVE64): the same files as 0 (signature rev '1');
-//   2 - rlgr_fast.hpp, lazy reservation ("holes"): only a run header is laid ahead (1 + k bits), every other code takes
-//       a page when its first bit is written; a new format (rev '2');
+//   2 - lazy reservation ("holes"): only a run header is laid ahead (1 + k bits), every other code takes a page when its
+//       first bit is written, so a stream holds at most two pages: rlgr_lazy.hpp, two page slots instead of a ring;
+//       a new format (rev '2');
 //   3 - rlgr_lane.hpp: one bit lane for all the coders of the image; every code is written at the head the moment it is
 //       known, a run header gets a hole of 1 + k bits that is filled at the end of the run, a full window gives its
 //       k unused bits back when nothing was written after its hole; no pages; a new format (rev '3');
@@ -43,8 +44,10 @@
 #if LLRICE_ENGINE == 2 && defined(RLGR_RESERVE64)
 #error "LLRICE_ENGINE 2 is the lazy reservation: do not define RLGR_RESERVE64"
 #endif
-#if LLRICE_ENGINE == 1 || LLRICE_ENGINE == 2
+#if LLRICE_ENGINE == 1
 #include "rlgr_fast.hpp"
+#elif LLRICE_ENGINE == 2
+#include "rlgr_lazy.hpp"
 #elif LLRICE_ENGINE == 3
 #include "rlgr_lane.hpp"
 #elif LLRICE_ENGINE == 4
@@ -85,17 +88,22 @@ namespace llrice
         using RawW = BitStream::Writer; using RawR = BitStream::Reader;
     };
 #if LLRICE_ENGINE == 1 || LLRICE_ENGINE == 2
+#if LLRICE_ENGINE == 1
+    namespace fast_ns = rlgrf;
+#else
+    namespace fast_ns = rlgrz;
+#endif
     struct FastIn { const uint64_t* p; size_t top; size_t n; };   // decoder side: the pages and the next free one
-    struct FastEnc : rlgrf::Encoder { explicit FastEnc(rlgrf::PageBuf& pb) : rlgrf::Encoder(&pb) {} };
-    struct FastDec : rlgrf::Decoder { explicit FastDec(FastIn& in) : rlgrf::Decoder(in.p, &in.top, in.n) {} };
+    struct FastEnc : fast_ns::Encoder { explicit FastEnc(rlgrf::PageBuf& pb) : fast_ns::Encoder(&pb) {} };
+    struct FastDec : fast_ns::Decoder { explicit FastDec(FastIn& in) : fast_ns::Decoder(in.p, &in.top, in.n) {} };
     struct FastRawW {
-        rlgrf::Writer w; explicit FastRawW(rlgrf::PageBuf& pb) : w(&pb) {}
+        fast_ns::Writer w; explicit FastRawW(rlgrf::PageBuf& pb) : w(&pb) {}
         inline void reserve(int n) { w.reserve(n); }
         inline void put_bits(uint32_t n, uint32_t v) { if (n) w.put(int(n), v); }
         inline void flush() { w.flush(); }
     };
     struct FastRawR {
-        rlgrf::Reader r; explicit FastRawR(FastIn& in) : r(in.p, &in.top, in.n) {}
+        fast_ns::Reader r; explicit FastRawR(FastIn& in) : r(in.p, &in.top, in.n) {}
         inline void reserve(uint32_t n) { r.reserve(int(n)); }
         inline uint32_t peek_n(uint32_t n) { return n ? uint32_t(r.window() >> (64 - n)) : 0; }
         inline void skip(uint32_t n) { r.skip(int(n)); }
