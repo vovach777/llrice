@@ -16,6 +16,22 @@
 #include "bitstream.hpp"
 #include "rlgr.hpp"
 #include "image.hpp"
+// LLRICE_FAST 1 (default): the RLGR streams run on rlgr_fast.hpp (lean page buffer, 4-entry page rings, branchless
+// Rice prefix by count-leading-ones) with the llrice reservation rule (RLGR_RESERVE64), byte-identical files.
+// 0: the original RLGR / BitStream / PagePool classes. USE_SIMPLE_RLGR, USE_MODEL_K and USE_NEW_LINE need 0.
+#ifndef LLRICE_FAST
+#if defined(USE_SIMPLE_RLGR) || defined(USE_MODEL_K) || defined(USE_NEW_LINE)
+#define LLRICE_FAST 0
+#else
+#define LLRICE_FAST 1
+#endif
+#endif
+#if LLRICE_FAST
+#ifndef RLGR_RESERVE64
+#define RLGR_RESERVE64   // the llrice reservation points: same pages, same file
+#endif
+#include "rlgr_fast.hpp"
+#endif
 
 //#define USE_YCoCg
 //#define USE_SIMPLE_RLGR
@@ -37,6 +53,36 @@ namespace llrice
     constexpr inline auto ext = ".llr";
     constexpr inline uint8_t rev = '1';
     constexpr inline uint32_t signature = 'l' | 'l' << 8U | 'r' << 16U | rev << 24U;
+
+    // stream classes per page store: PagePool -> original llrice classes, rlgrf::PageBuf / FastIn -> rlgr_fast
+    template <typename Pool> struct Coders;
+    template <> struct Coders<PagePool> {
+#ifdef USE_SIMPLE_RLGR
+        using Enc = RLGR::Simple::Encoder; using Dec = RLGR::Simple::Decoder;
+#else
+        using Enc = RLGR::Encoder; using Dec = RLGR::Decoder;
+#endif
+        using RawW = BitStream::Writer; using RawR = BitStream::Reader;
+    };
+#if LLRICE_FAST
+    struct FastIn { const uint64_t* p; size_t top; size_t n; };   // decoder side: the pages and the next free one
+    struct FastEnc : rlgrf::Encoder { explicit FastEnc(rlgrf::PageBuf& pb) : rlgrf::Encoder(&pb) {} };
+    struct FastDec : rlgrf::Decoder { explicit FastDec(FastIn& in) : rlgrf::Decoder(in.p, &in.top, in.n) {} };
+    struct FastRawW {
+        rlgrf::Writer w; explicit FastRawW(rlgrf::PageBuf& pb) : w(&pb) {}
+        inline void reserve(int n) { w.reserve(n); }
+        inline void put_bits(uint32_t n, uint32_t v) { if (n) w.put(int(n), v); }
+        inline void flush() { w.flush(); }
+    };
+    struct FastRawR {
+        rlgrf::Reader r; explicit FastRawR(FastIn& in) : r(in.p, &in.top, in.n) {}
+        inline void reserve(uint32_t n) { r.reserve(int(n)); }
+        inline uint32_t peek_n(uint32_t n) { return n ? uint32_t(r.window() >> (64 - n)) : 0; }
+        inline void skip(uint32_t n) { r.skip(int(n)); }
+    };
+    template <> struct Coders<rlgrf::PageBuf> { using Enc = FastEnc; using RawW = FastRawW; };
+    template <> struct Coders<FastIn> { using Dec = FastDec; using RawR = FastRawR; };
+#endif
 
     template <typename T>
     inline T median(T a, T b, T c)
@@ -103,8 +149,8 @@ void LOCO_I(Load && load, size_t width, size_t height) {
 
 
 
-    template <typename T, typename RGBLoader>
-    auto rlgr_encode(PagePool& out_pool, uint32_t width, uint32_t height, RGBLoader && rgbloader)
+    template <typename T, typename Pool, typename RGBLoader>
+    void rlgr_encode(Pool& out_pool, uint32_t width, uint32_t height, RGBLoader && rgbloader)
     {
         uint32_t stride = width;
         std::vector<T> lines_storage(width * 3 * 2);
@@ -116,18 +162,14 @@ void LOCO_I(Load && load, size_t width, size_t height) {
             };
 
 
-#ifdef USE_SIMPLE_RLGR
-        using Encoder = RLGR::Simple::Encoder;
-#else
-        using Encoder = RLGR::Encoder;
-#endif
+        using Encoder = typename Coders<Pool>::Enc;
 
         Encoder g_encoder(out_pool);
         #if CODER == CODER_G_RB  ||  CODER == CODER_G_RB_SUM
         Encoder rb_encoder(out_pool);
         #endif
         #if CODER == CODER_G_RB_SUM
-            BitStream::Writer rem_encoder(out_pool);
+            typename Coders<Pool>::RawW rem_encoder(out_pool);
         #endif
         #if CODER == CODER_G_R_B
             Encoder r_encoder(out_pool);
@@ -315,31 +357,24 @@ void LOCO_I(Load && load, size_t width, size_t height) {
             r_encoder.flush();
             b_encoder.flush();
         #endif
-
-        return out_pool.move();
     }
 
 
-    template <typename UT, typename T, typename Store>
-    inline void rlgr_decode(PagePool& pool, Store && store,  uint32_t width, uint32_t height)
+    template <typename UT, typename T, typename Pool, typename Store>
+    inline void rlgr_decode(Pool& pool, Store && store,  uint32_t width, uint32_t height)
     {
         std::array<std::array<std::vector<T>,3>,2> lines
             {
                 std::array{std::vector<T>(width),std::vector<T>(width),std::vector<T>(width)},
                 std::array{std::vector<T>(width),std::vector<T>(width),std::vector<T>(width)}
             };
-        using Stream = BitStream::Reader;
-#ifdef USE_SIMPLE_RLGR
-        using Decoder = RLGR::Simple::Decoder;
-#else
-        using Decoder = RLGR::Decoder;
-#endif
+        using Decoder = typename Coders<Pool>::Dec;
         Decoder g_decoder(pool);
         #if  CODER == CODER_G_RB || CODER == CODER_G_RB_SUM
         Decoder rb_decoder(pool);
         #endif
         #if CODER == CODER_G_RB_SUM
-            BitStream::Reader rem_bs(pool);
+            typename Coders<Pool>::RawR rem_bs(pool);
         #endif
 
         #if CODER == CODER_G_R_B
@@ -523,11 +558,19 @@ void LOCO_I(Load && load, size_t width, size_t height) {
     {
         Header hdr{0, img.width, img.height,static_cast<uint16_t>(1 << 15), img.channel_nb, img.bits_per_channel };
         hdr.protect();
+#if LLRICE_FAST
+        rlgrf::PageBuf out_pool;
+        out_pool.w.resize(size_t(hdr.width) * hdr.height / 8 + 1024);   // grows on demand
+        out_pool.take(); //для заголовка
+        out_pool.take();
+        std::memcpy(out_pool.w.data(), &hdr, sizeof(Header));
+#else
         PagePool out_pool;
         out_pool.reserve(hdr.width*hdr.height);
         out_pool.acquire_page(); //для заголовка
         out_pool.acquire_page();
         std::memcpy(&(out_pool[0]), &hdr, sizeof(Header));
+#endif
 
         if ( img.channel_type == RawImage::ChannelType::uint16 ) {
             auto pixels = img.as<uint16_t>();
@@ -548,7 +591,12 @@ void LOCO_I(Load && load, size_t width, size_t height) {
             });
         } else
         throw std::runtime_error("Unsupported channel type");
+#if LLRICE_FAST
+        out_pool.w.resize(out_pool.top);
+        return std::move(out_pool.w);
+#else
         return out_pool.move();
+#endif
     }
 
 
@@ -563,11 +611,20 @@ void LOCO_I(Load && load, size_t width, size_t height) {
         Header hdr;
         RawImage img;
 
+        if (poolvec.size() < 2) throw std::runtime_error("truncated file");
+#if LLRICE_FAST
+        FastIn pool{poolvec.data(), 2, poolvec.size()};   //пропускаем заголовок
+#else
         PagePool pool(std::move(poolvec));
         pool.get_next_read_page(); //пропускаем заголовок
         pool.get_next_read_page();
+#endif
 
+#if LLRICE_FAST
+        std::memcpy(&hdr, poolvec.data(), sizeof(Header));
+#else
         std::memcpy(&hdr, &(pool[0]), sizeof(Header));
+#endif
         if (!hdr.check()) {
             throw std::runtime_error("Header CRC check failed");
         }
