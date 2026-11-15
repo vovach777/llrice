@@ -24,7 +24,9 @@
 //       a page when its first bit is written; a new format (rev '2');
 //   3 - rlgr_lane.hpp: one bit lane for all the coders of the image; every code is written at the head the moment it is
 //       known, a run header gets a hole of 1 + k bits that is filled at the end of the run, a full window gives its
-//       k unused bits back when nothing was written after its hole; no pages; a new format (rev '3').
+//       k unused bits back when nothing was written after its hole; no pages; a new format (rev '3');
+//   4 - rlgr_lane2.hpp: the lane of 3 with holes of up to 8 pieces: the unused bits of a full window start the next
+//       hole of the same coder even if other coders wrote after it; the size of 1/2, no pages (rev '4').
 // LLRICE_FAST=0 is the old spelling of LLRICE_ENGINE=0. USE_SIMPLE_RLGR, USE_MODEL_K and USE_NEW_LINE need 0.
 #ifndef LLRICE_ENGINE
 #if (defined(LLRICE_FAST) && LLRICE_FAST == 0) || defined(USE_SIMPLE_RLGR) || defined(USE_MODEL_K) || defined(USE_NEW_LINE)
@@ -43,6 +45,8 @@
 #include "rlgr_fast.hpp"
 #elif LLRICE_ENGINE == 3
 #include "rlgr_lane.hpp"
+#elif LLRICE_ENGINE == 4
+#include "rlgr_lane2.hpp"
 #endif
 
 //#define USE_YCoCg
@@ -94,9 +98,14 @@ namespace llrice
     };
     template <> struct Coders<rlgrf::PageBuf> { using Enc = FastEnc; using RawW = FastRawW; };
     template <> struct Coders<FastIn> { using Dec = FastDec; using RawR = FastRawR; };
-#elif LLRICE_ENGINE == 3
-    struct LaneEnc : rlgrl::Encoder { explicit LaneEnc(rlgrl::Lane& l) : rlgrl::Encoder(&l) {} };
-    struct LaneDec : rlgrl::Decoder { explicit LaneDec(rlgrl::LaneR& r) : rlgrl::Decoder(&r) {} };
+#elif LLRICE_ENGINE >= 3
+#if LLRICE_ENGINE == 3
+    namespace lane_ns = rlgrl;
+#else
+    namespace lane_ns = rlgrl2;
+#endif
+    struct LaneEnc : lane_ns::Encoder { explicit LaneEnc(rlgrl::Lane& l) : lane_ns::Encoder(&l) {} };
+    struct LaneDec : lane_ns::Decoder { explicit LaneDec(rlgrl::LaneR& r) : lane_ns::Decoder(&r) {} };
     struct LaneRawW {
         rlgrl::Lane& l; explicit LaneRawW(rlgrl::Lane& l_) : l(l_) {}
         inline void reserve(int) {}
@@ -587,7 +596,7 @@ void LOCO_I(Load && load, size_t width, size_t height) {
     {
         Header hdr{0, img.width, img.height,static_cast<uint16_t>(1 << 15), img.channel_nb, img.bits_per_channel };
         hdr.protect();
-#if LLRICE_ENGINE == 3
+#if LLRICE_ENGINE >= 3
         rlgrl::Lane out_pool;                       // the header takes the first 128 bits of the lane
         out_pool.w.resize(size_t(hdr.width) * hdr.height / 8 + 1024);   // grows on demand
         out_pool.head = 128;
@@ -625,7 +634,7 @@ void LOCO_I(Load && load, size_t width, size_t height) {
             });
         } else
         throw std::runtime_error("Unsupported channel type");
-#if LLRICE_ENGINE == 3
+#if LLRICE_ENGINE >= 3
         out_pool.w.resize(out_pool.words());
         return std::move(out_pool.w);
 #elif LLRICE_ENGINE
@@ -649,7 +658,7 @@ void LOCO_I(Load && load, size_t width, size_t height) {
         RawImage img;
 
         if (poolvec.size() < 2) throw std::runtime_error("truncated file");
-#if LLRICE_ENGINE == 3
+#if LLRICE_ENGINE >= 3
         const size_t nwords = poolvec.size();
         poolvec.push_back(0); poolvec.push_back(0);  // the reader peeks two words ahead
         rlgrl::LaneR pool; pool.w = poolvec.data(); pool.nw = nwords + 2; pool.head = 128;   //пропускаем заголовок
