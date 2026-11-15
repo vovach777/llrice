@@ -16,21 +16,33 @@
 #include "bitstream.hpp"
 #include "rlgr.hpp"
 #include "image.hpp"
-// LLRICE_FAST 1 (default): the RLGR streams run on rlgr_fast.hpp (lean page buffer, 4-entry page rings, branchless
-// Rice prefix by count-leading-ones) with the llrice reservation rule (RLGR_RESERVE64), byte-identical files.
-// 0: the original RLGR / BitStream / PagePool classes. USE_SIMPLE_RLGR, USE_MODEL_K and USE_NEW_LINE need 0.
-#ifndef LLRICE_FAST
-#if defined(USE_SIMPLE_RLGR) || defined(USE_MODEL_K) || defined(USE_NEW_LINE)
-#define LLRICE_FAST 0
+// LLRICE_ENGINE - the bit stream engine of the RLGR coders (compile time, like CODER):
+//   0 - the original RLGR / BitStream / PagePool classes;
+//   1 - rlgr_fast.hpp (default): lean page buffer, 4-entry page rings, Rice prefix by count-leading-ones, with the
+//       llrice reservation rule (RLGR_RESERVE64): the same files as 0 (signature rev '1');
+//   2 - rlgr_fast.hpp, lazy reservation ("holes"): only a run header is laid ahead (1 + k bits), every other code takes
+//       a page when its first bit is written; a new format (rev '2');
+//   3 - rlgr_lane.hpp: one bit lane for all the coders of the image; every code is written at the head the moment it is
+//       known, a run header gets a hole of 1 + k bits that is filled at the end of the run, a full window gives its
+//       k unused bits back when nothing was written after its hole; no pages; a new format (rev '3').
+// LLRICE_FAST=0 is the old spelling of LLRICE_ENGINE=0. USE_SIMPLE_RLGR, USE_MODEL_K and USE_NEW_LINE need 0.
+#ifndef LLRICE_ENGINE
+#if (defined(LLRICE_FAST) && LLRICE_FAST == 0) || defined(USE_SIMPLE_RLGR) || defined(USE_MODEL_K) || defined(USE_NEW_LINE)
+#define LLRICE_ENGINE 0
 #else
-#define LLRICE_FAST 1
+#define LLRICE_ENGINE 1
 #endif
 #endif
-#if LLRICE_FAST
-#ifndef RLGR_RESERVE64
+#if LLRICE_ENGINE == 1 && !defined(RLGR_RESERVE64)
 #define RLGR_RESERVE64   // the llrice reservation points: same pages, same file
 #endif
+#if LLRICE_ENGINE == 2 && defined(RLGR_RESERVE64)
+#error "LLRICE_ENGINE 2 is the lazy reservation: do not define RLGR_RESERVE64"
+#endif
+#if LLRICE_ENGINE == 1 || LLRICE_ENGINE == 2
 #include "rlgr_fast.hpp"
+#elif LLRICE_ENGINE == 3
+#include "rlgr_lane.hpp"
 #endif
 
 //#define USE_YCoCg
@@ -51,7 +63,7 @@
 namespace llrice
 {
     constexpr inline auto ext = ".llr";
-    constexpr inline uint8_t rev = '1';
+    constexpr inline uint8_t rev = LLRICE_ENGINE >= 2 ? uint8_t('0' + LLRICE_ENGINE) : uint8_t('1');   // new formats: other signatures
     constexpr inline uint32_t signature = 'l' | 'l' << 8U | 'r' << 16U | rev << 24U;
 
     // stream classes per page store: PagePool -> original llrice classes, rlgrf::PageBuf / FastIn -> rlgr_fast
@@ -64,7 +76,7 @@ namespace llrice
 #endif
         using RawW = BitStream::Writer; using RawR = BitStream::Reader;
     };
-#if LLRICE_FAST
+#if LLRICE_ENGINE == 1 || LLRICE_ENGINE == 2
     struct FastIn { const uint64_t* p; size_t top; size_t n; };   // decoder side: the pages and the next free one
     struct FastEnc : rlgrf::Encoder { explicit FastEnc(rlgrf::PageBuf& pb) : rlgrf::Encoder(&pb) {} };
     struct FastDec : rlgrf::Decoder { explicit FastDec(FastIn& in) : rlgrf::Decoder(in.p, &in.top, in.n) {} };
@@ -82,6 +94,23 @@ namespace llrice
     };
     template <> struct Coders<rlgrf::PageBuf> { using Enc = FastEnc; using RawW = FastRawW; };
     template <> struct Coders<FastIn> { using Dec = FastDec; using RawR = FastRawR; };
+#elif LLRICE_ENGINE == 3
+    struct LaneEnc : rlgrl::Encoder { explicit LaneEnc(rlgrl::Lane& l) : rlgrl::Encoder(&l) {} };
+    struct LaneDec : rlgrl::Decoder { explicit LaneDec(rlgrl::LaneR& r) : rlgrl::Decoder(&r) {} };
+    struct LaneRawW {
+        rlgrl::Lane& l; explicit LaneRawW(rlgrl::Lane& l_) : l(l_) {}
+        inline void reserve(int) {}
+        inline void put_bits(uint32_t n, uint32_t v) { if (n) l.put(int(n), v); }
+        inline void flush() {}
+    };
+    struct LaneRawR {
+        rlgrl::LaneR& r; explicit LaneRawR(rlgrl::LaneR& r_) : r(r_) {}
+        inline void reserve(uint32_t) {}
+        inline uint32_t peek_n(uint32_t n) { return n ? uint32_t(r.window() >> (64 - n)) : 0; }
+        inline void skip(uint32_t n) { r.skip(int(n)); }
+    };
+    template <> struct Coders<rlgrl::Lane> { using Enc = LaneEnc; using RawW = LaneRawW; };
+    template <> struct Coders<rlgrl::LaneR> { using Dec = LaneDec; using RawR = LaneRawR; };
 #endif
 
     template <typename T>
@@ -558,7 +587,12 @@ void LOCO_I(Load && load, size_t width, size_t height) {
     {
         Header hdr{0, img.width, img.height,static_cast<uint16_t>(1 << 15), img.channel_nb, img.bits_per_channel };
         hdr.protect();
-#if LLRICE_FAST
+#if LLRICE_ENGINE == 3
+        rlgrl::Lane out_pool;                       // the header takes the first 128 bits of the lane
+        out_pool.w.resize(size_t(hdr.width) * hdr.height / 8 + 1024);   // grows on demand
+        out_pool.head = 128;
+        std::memcpy(out_pool.w.data(), &hdr, sizeof(Header));
+#elif LLRICE_ENGINE
         rlgrf::PageBuf out_pool;
         out_pool.w.resize(size_t(hdr.width) * hdr.height / 8 + 1024);   // grows on demand
         out_pool.take(); //для заголовка
@@ -591,7 +625,10 @@ void LOCO_I(Load && load, size_t width, size_t height) {
             });
         } else
         throw std::runtime_error("Unsupported channel type");
-#if LLRICE_FAST
+#if LLRICE_ENGINE == 3
+        out_pool.w.resize(out_pool.words());
+        return std::move(out_pool.w);
+#elif LLRICE_ENGINE
         out_pool.w.resize(out_pool.top);
         return std::move(out_pool.w);
 #else
@@ -612,7 +649,11 @@ void LOCO_I(Load && load, size_t width, size_t height) {
         RawImage img;
 
         if (poolvec.size() < 2) throw std::runtime_error("truncated file");
-#if LLRICE_FAST
+#if LLRICE_ENGINE == 3
+        const size_t nwords = poolvec.size();
+        poolvec.push_back(0); poolvec.push_back(0);  // the reader peeks two words ahead
+        rlgrl::LaneR pool; pool.w = poolvec.data(); pool.nw = nwords + 2; pool.head = 128;   //пропускаем заголовок
+#elif LLRICE_ENGINE
         FastIn pool{poolvec.data(), 2, poolvec.size()};   //пропускаем заголовок
 #else
         PagePool pool(std::move(poolvec));
@@ -620,7 +661,7 @@ void LOCO_I(Load && load, size_t width, size_t height) {
         pool.get_next_read_page();
 #endif
 
-#if LLRICE_FAST
+#if LLRICE_ENGINE
         std::memcpy(&hdr, poolvec.data(), sizeof(Header));
 #else
         std::memcpy(&hdr, &(pool[0]), sizeof(Header));
