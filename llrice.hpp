@@ -65,6 +65,9 @@
 #ifndef CODER
 #define CODER CODER_G_R_B
 #endif
+#if LLRICE_ENGINE == 6
+#include "rlh.hpp"
+#endif
 // CODER_G_RB_SUM: r in 0..rb (rb + 1 values). TRUNC_SPLIT 1: truncated binary, k = floor(log2(rb + 1)) bits if
 // r < u = 2^(k+1) - (rb + 1), else k + 1 bits of r + u (no code is wasted). 0: bit_width(rb) bits (old format).
 #ifndef TRUNC_SPLIT
@@ -87,11 +90,13 @@ namespace llrice
 #endif
         using RawW = BitStream::Writer; using RawR = BitStream::Reader;
     };
-#if LLRICE_ENGINE == 1 || LLRICE_ENGINE == 2
+#if LLRICE_ENGINE == 1 || LLRICE_ENGINE == 2 || LLRICE_ENGINE == 6
 #if LLRICE_ENGINE == 1
     namespace fast_ns = rlgrf;
-#else
+#elif LLRICE_ENGINE == 2
     namespace fast_ns = rlgrz;
+#else
+    namespace fast_ns = rlh;
 #endif
     struct FastIn { const uint64_t* p; size_t top; size_t n; };   // decoder side: the pages and the next free one
     struct FastEnc : fast_ns::Encoder { explicit FastEnc(rlgrf::PageBuf& pb) : fast_ns::Encoder(&pb) {} };
@@ -127,7 +132,7 @@ namespace llrice
     };
     template <> struct Coders<rlgrb::Buf> { using Enc = BytesEnc; using RawW = BytesRawW; };
     template <> struct Coders<rlgrb::In> { using Dec = BytesDec; using RawR = BytesRawR; };
-#elif LLRICE_ENGINE >= 3
+#elif LLRICE_ENGINE == 3 || LLRICE_ENGINE == 4
 #if LLRICE_ENGINE == 3
     namespace lane_ns = rlgrl;
 #else
@@ -630,7 +635,7 @@ void LOCO_I(Load && load, size_t width, size_t height) {
         out_pool.b.resize(size_t(hdr.width) * hdr.height + 1024);   // grows on demand
         out_pool.head = sizeof(Header);
         std::memcpy(out_pool.b.data(), &hdr, sizeof(Header));
-#elif LLRICE_ENGINE >= 3
+#elif LLRICE_ENGINE == 3 || LLRICE_ENGINE == 4
         rlgrl::Lane out_pool;                       // the header takes the first 128 bits of the lane
         out_pool.w.resize(size_t(hdr.width) * hdr.height / 8 + 1024);   // grows on demand
         out_pool.head = 128;
@@ -672,7 +677,7 @@ void LOCO_I(Load && load, size_t width, size_t height) {
         std::vector<uint64_t> out((out_pool.head + 7) / 8, 0);
         std::memcpy(out.data(), out_pool.b.data(), out_pool.head);
         return out;
-#elif LLRICE_ENGINE >= 3
+#elif LLRICE_ENGINE == 3 || LLRICE_ENGINE == 4
         out_pool.w.resize(out_pool.words());
         return std::move(out_pool.w);
 #elif LLRICE_ENGINE
@@ -698,7 +703,7 @@ void LOCO_I(Load && load, size_t width, size_t height) {
         if (poolvec.size() < 2) throw std::runtime_error("truncated file");
 #if LLRICE_ENGINE == 5
         rlgrb::In pool{reinterpret_cast<const uint8_t*>(poolvec.data()), poolvec.size() * 8, sizeof(Header)};
-#elif LLRICE_ENGINE >= 3
+#elif LLRICE_ENGINE == 3 || LLRICE_ENGINE == 4
         const size_t nwords = poolvec.size();
         poolvec.push_back(0); poolvec.push_back(0);  // the reader peeks two words ahead
         rlgrl::LaneR pool; pool.w = poolvec.data(); pool.nw = nwords + 2; pool.head = 128;   //пропускаем заголовок
