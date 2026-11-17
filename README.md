@@ -58,7 +58,7 @@ engine that wrote it (a mismatch is rejected by the header CRC).
 | **7** | **RLH7 fast** | RLH with retrained tables: 8 regimes × 14 contexts, trained regime selector |
 | **8** | **RLH7 strong** | RLH with retrained tables: 24 regimes × 34 contexts, trained regime selector |
 
-Engines 6/7/8 require `-DCODER=3`. Measured on this machine (gcc 13, `-O3 -DNDEBUG -march=native`,
+Engines 6/7/8 require `-DCODER=3`. Measured on this machine (gcc 12.2, `-O3 -DNDEBUG -march=native`,
 2 cores, best of repeated interleaved runs; **absolute MB/s are machine-specific**):
 
 **Screens — 12 images from `halic-wins-screen-p6`, 74 967 858 px**
