@@ -68,6 +68,14 @@
 #if LLRICE_ENGINE == 6
 #include "rlh.hpp"
 #endif
+#if LLRICE_ENGINE == 7
+#define RLH7_MODE 0
+#include "rlh7.hpp"
+#endif
+#if LLRICE_ENGINE == 8
+#define RLH7_MODE 1
+#include "rlh7.hpp"
+#endif
 // CODER_G_RB_SUM: r in 0..rb (rb + 1 values). TRUNC_SPLIT 1: truncated binary, k = floor(log2(rb + 1)) bits if
 // r < u = 2^(k+1) - (rb + 1), else k + 1 bits of r + u (no code is wasted). 0: bit_width(rb) bits (old format).
 #ifndef TRUNC_SPLIT
@@ -90,13 +98,15 @@ namespace llrice
 #endif
         using RawW = BitStream::Writer; using RawR = BitStream::Reader;
     };
-#if LLRICE_ENGINE == 1 || LLRICE_ENGINE == 2 || LLRICE_ENGINE == 6
+#if LLRICE_ENGINE == 1 || LLRICE_ENGINE == 2 || LLRICE_ENGINE == 6 || LLRICE_ENGINE == 7 || LLRICE_ENGINE == 8
 #if LLRICE_ENGINE == 1
     namespace fast_ns = rlgrf;
 #elif LLRICE_ENGINE == 2
     namespace fast_ns = rlgrz;
-#else
+#elif LLRICE_ENGINE == 6
     namespace fast_ns = rlh;
+#else
+    namespace fast_ns = rlh7;
 #endif
     struct FastIn { const uint64_t* p; size_t top; size_t n; };   // decoder side: the pages and the next free one
     struct FastEnc : fast_ns::Encoder { explicit FastEnc(rlgrf::PageBuf& pb) : fast_ns::Encoder(&pb) {} };
