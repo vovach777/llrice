@@ -65,31 +65,60 @@ static double huff_bits(const std::vector<uint64_t>& f, int& used) {
 }
 
 struct Tok { uint32_t cr, cv, ph, vk; uint32_t man; };
-static void tokenize(const std::vector<uint16_t>& s, int P, std::vector<Tok>& t) {
+// rowlayout: 0 = flat stream (phase = st % P), 1 = row-planar (phase = offset/W),
+//            2 = row-interleaved (phase = offset%3).  reset = cut the zero run at each row start.
+static void tokenize(const std::vector<uint16_t>& s, int P, std::vector<Tok>& t,
+                     int rowlayout = 0, size_t W = 0, bool reset = false,
+                     const std::vector<uint8_t>* rowlay = nullptr) {
     t.clear(); uint32_t rl = 0; size_t idx = 0, st = 0; bool start = true;
+    const size_t rowlen = 3 * W;
+    auto phase_of = [&](size_t pos) -> uint32_t {
+        if (!rowlayout) return uint32_t(pos % size_t(P));
+        const size_t o = pos % rowlen;
+        const int rl_ = rowlay ? (*rowlay)[pos / rowlen] : rowlayout;
+        return uint32_t(rl_ == 1 ? o / W : o % 3);
+    };
     for (uint32_t x : s) {
+        if (rowlayout && reset && W && idx && (idx % rowlen) == 0 && rl) {
+            const uint32_t cr = uint32_t(bw(rl));
+            t.push_back({ cr, 0, phase_of(st), 0, cr > 1 ? cr - 1 : 0 });
+            rl = 0; start = true;
+        }
         if (start) { st = idx; start = false; }
         ++idx;
         if (!x) { ++rl; continue; }
         const uint32_t cr = uint32_t(bw(rl)), vk = uint32_t(bw(x));
-        t.push_back({ cr, uint32_t(cv_of(x)), uint32_t(st % size_t(P)), vk,
+        t.push_back({ cr, uint32_t(cv_of(x)), phase_of(st), vk,
                       (cr > 1 ? cr - 1 : 0) + uint32_t(vm_of(x)) });
         rl = 0; start = true;
     }
-    if (rl) { const uint32_t cr = uint32_t(bw(rl)); t.push_back({ cr, 0, uint32_t(st % size_t(P)), 0, cr > 1 ? cr - 1 : 0 }); }
+    if (rl) { const uint32_t cr = uint32_t(bw(rl)); t.push_back({ cr, 0, phase_of(st), 0, cr > 1 ? cr - 1 : 0 }); }
 }
 
-struct Cfg { const char* name; int layout; int ctxmode; int phase; };
+// exact run-mantissa cost of one row under a layout (the term that differs between layouts)
+static double row_man_cost(const std::vector<uint16_t>* v, size_t off, size_t W, bool interl) {
+    double bits = 0; uint32_t rl = 0;
+    auto feed = [&](uint32_t x) { if (!x) { ++rl; return; } if (rl > 1) bits += bw(rl) - 1; rl = 0; };
+    if (interl) { for (size_t i = 0; i < W; ++i) for (int c = 0; c < 3; ++c) feed(v[c][off + i]); }
+    else { for (int c = 0; c < 3; ++c) { rl = 0; for (size_t i = 0; i < W; ++i) feed(v[c][off + i]); if (rl > 1) bits += bw(rl) - 1; rl = 0; } }
+    if (interl && rl > 1) bits += bw(rl) - 1;
+    return bits;
+}
+struct Cfg { const char* name; int layout; int ctxmode; int phase; int rowlayout; bool reset; };
 // layout 0 = g,r,b separate; 1 = g + (r,b); 2 = one stream
 static const Cfg CFG[] = {
-    { "separate   ctx34",        0, 34, 0 },
-    { "separate   ctx14",        0, 14, 0 },
-    { "g+(r,b)    ctx34 no ph",  1, 34, 0 },
-    { "g+(r,b)    ctx34 x ph2",  1, 34, 1 },
-    { "g+(r,b)    ctx14 x ph2",  1, 14, 1 },
-    { "one stream ctx34 no ph",  2, 34, 0 },
-    { "one stream ctx34 x ph3",  2, 34, 1 },
-    { "one stream ctx14 x ph3",  2, 14, 1 },
+    { "separate   ctx34 (base)", 0, 34, 0, 0, false },
+    { "g+(r,b)    ctx34 x ph2",  1, 34, 1, 0, false },
+    { "one interl ctx34 x ph3",  2, 34, 1, 0, false },
+    { "ROW planar ctx34 x pl3",  3, 34, 1, 1, true  },
+    { "ROW planar ctx34 noreset",3, 34, 1, 1, false },
+    { "ROW planar ctx34 no ph",  3, 34, 0, 1, true  },
+    { "ROW interl ctx34 x ph3",  3, 34, 1, 2, true  },
+    { "ROW interl ctx14 x ph3",  3, 14, 1, 2, true  },
+    { "ROW ADAPT  ctx34 x ph3",  4, 34, 1, 1, true  },
+    { "ROW ADAPT  ctx14 x ph3",  4, 14, 1, 1, true  },
+    { "ROW COST   ctx34 x ph3",  5, 34, 1, 1, true  },
+    { "ROW COST   ctx14 x ph3",  5, 14, 1, 1, true  },
 };
 constexpr int NC = int(sizeof(CFG) / sizeof(CFG[0]));
 
@@ -105,7 +134,7 @@ int main(int argc, char** argv) {
         } else files.push_back(p.string());
     }
     double px = 0, bits[NC] = {}, man[NC] = {}, hdr[NC] = {}; double tok[NC] = {};
-    std::vector<uint16_t> inter; std::vector<Tok> t;
+    std::vector<uint16_t> inter; std::vector<Tok> t; std::vector<uint8_t> rowlay;
     for (auto& f : files) {
         RawImage img; img.load(f); img.le();
         if (img.channel_type != RawImage::ChannelType::uint8) { fprintf(stderr, "skip %s\n", f.c_str()); continue; }
@@ -125,14 +154,55 @@ int main(int argc, char** argv) {
                 inter.resize(2 * n);
                 for (size_t i = 0; i < n; ++i) { inter[2*i] = sink.val[1][i]; inter[2*i+1] = sink.val[2][i]; }
                 parts = { &sink.val[0], &inter }; P = 1;   // phase only inside the chroma stream
-            } else {
+            } else if (C.layout == 2) {
                 inter.resize(3 * n);
                 for (size_t i = 0; i < n; ++i) { inter[3*i] = sink.val[0][i]; inter[3*i+1] = sink.val[1][i]; inter[3*i+2] = sink.val[2][i]; }
+                parts = { &inter }; P = 3;
+            } else if (C.layout == 4 || C.layout == 5) {
+                // per-row layout, chosen CAUSALLY from the previous row's non-zero fraction:
+                // sparse rows -> interleave (merge the zero runs), dense rows -> planar (keep them).
+                const size_t W = img.width, H = img.height;
+                inter.resize(3 * n); rowlay.assign(H, 1);
+                for (size_t h = 0; h < H; ++h) {
+                    if (h) {
+                        if (C.layout == 5) {
+                            // causal and exact: price both layouts on the PREVIOUS row, which the
+                            // decoder already has, and use the cheaper one for this row.
+                            const double cp = row_man_cost(sink.val, (h-1)*W, W, false);
+                            const double ci = row_man_cost(sink.val, (h-1)*W, W, true);
+                            rowlay[h] = (ci < cp) ? 2 : 1;
+                        } else {
+                            size_t nz = 0;
+                            for (int c = 0; c < 3; ++c)
+                                for (size_t i = 0; i < W; ++i) nz += (sink.val[c][(h-1)*W + i] != 0);
+                            rowlay[h] = (double(nz) / double(3 * W) < 0.30) ? 2 : 1;
+                        }
+                    } else rowlay[h] = 1;                                          // first row: planar
+                    if (rowlay[h] == 1)
+                        for (int c = 0; c < 3; ++c)
+                            std::copy_n(sink.val[c].begin() + h*W, W, inter.begin() + h*3*W + size_t(c)*W);
+                    else
+                        for (size_t i = 0; i < W; ++i)
+                            for (int c = 0; c < 3; ++c) inter[h*3*W + 3*i + size_t(c)] = sink.val[c][h*W + i];
+                }
+                parts = { &inter }; P = 3;
+            } else {
+                const size_t W = img.width, H = img.height;
+                inter.resize(3 * n);
+                if (C.rowlayout == 1) {
+                    for (size_t h = 0; h < H; ++h)
+                        for (int c = 0; c < 3; ++c)
+                            std::copy_n(sink.val[c].begin() + h * W, W, inter.begin() + h * 3 * W + size_t(c) * W);
+                } else {
+                    for (size_t h = 0; h < H; ++h)
+                        for (size_t i = 0; i < W; ++i)
+                            for (int c = 0; c < 3; ++c) inter[h * 3 * W + 3 * i + size_t(c)] = sink.val[c][h * W + i];
+                }
                 parts = { &inter }; P = 3;
             }
             for (size_t si = 0; si < parts.size(); ++si) {
                 const int Peff = (C.layout == 1 && si == 0) ? 1 : (C.layout == 1 ? 2 : P);
-                tokenize(*parts[si], C.phase ? Peff : 1, t);
+                tokenize(*parts[si], C.phase ? Peff : 1, t, C.layout >= 3 ? C.rowlayout : 0, img.width, C.reset, C.layout >= 4 ? &rowlay : nullptr);
                 tok[c] += double(t.size());
                 std::map<uint32_t, std::vector<uint64_t>> fr;
                 uint32_t pcr = 0, pvk = 0;
