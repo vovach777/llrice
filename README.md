@@ -73,7 +73,7 @@ For examples of how to use LLRice, please refer to the [examples directory](exam
 
 - **RLGR**: by microsoft....
 - **Iterleaved Deterministic BitStream**: auto maneged BitStreams.
-- **Prediction**: same FFV1
+- **Prediction**: MED
 
 ## Development Environment
 
