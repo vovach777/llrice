@@ -58,3 +58,38 @@ silently corrupts the stream — ENGINE 6 never hit it (max 364 slots), the 24-r
 * `frontend_bench.cpp` — the pixel→residual→value front end with a null encoder.
   `-DFE_LEVEL=1` adds run-length tokenisation and regime bookkeeping, so the difference to the full
   encoder isolates the table-lookup + bit-writing cost.
+
+## Layout research: cross-plane sub-streams (XPL), 2026-11-18
+
+Model tools only; the engine is unchanged.
+
+* `cross_model.cpp` (Claude) — planar layout with one coder, where plane r is split into sub-streams by a class
+  of g at the same pixel and plane b by a class of (g, r). Runs are counted inside a sub-stream; each sub-stream
+  has its own tables x ctx34 and its own EOB per chunk. Per-image semi-static Huffman + header estimate.
+  `XPL0` is a self-check: it equals SEP bit for bit.
+* `xpl_model_ext.cpp` (Hydrogen) — extends it with b contexts from the same-pixel r magnitude:
+  XPL4 sig(g) / rmag4(r), XPL5 rmag5(r), XPL6 sig(g) x rmag4(r), XPL7 lv3(r).
+* `xpl_roundtrip.cpp` (Hydrogen) — static canonical Huffman tables (length cap 15), 2-fold CV over the
+  screen and photo sets together, real bit-level encode + decode of every image, `mismatches` must be 0.
+  One global table set (no regime selector), so absolute bpp is above the engine's.
+
+```sh
+g++ -O3 -march=native -std=c++17 -I../.. tools/rlh7/xpl_model_ext.cpp -o xpl_model_ext
+./xpl_model_ext <ppm_dir>
+g++ -O3 -march=native -std=c++17 -I../.. tools/rlh7/xpl_roundtrip.cpp -o xpl_roundtrip
+./xpl_roundtrip <screens_ppm_dir> <photos_ppm_dir>
+```
+
+Reference (12 `halic-wins-screen-p6` / 30 CLIC, C512, EOB, exact runs 0..7), bpp:
+
+| layout | screens, per-image | CLIC30, per-image | screens, static CV | CLIC30, static CV |
+|---|---|---|---|---|
+| SEP  | 1.2673 | 8.7742 | 1.4724 | 9.1701 |
+| ONE ph3 | 1.1385 | 8.8117 | 1.4636 | 9.3908 |
+| GRB ph2 | 1.2016 | 8.7357 | 1.4314 | 9.1665 |
+| XPL2 | 1.1241 | 8.8407 | 1.2837 | 9.1899 |
+| XPL4 | 1.1450 | 8.7636 | 1.3172 | 9.1294 |
+| XPL6 | 1.1233 | 8.7873 | 1.2861 | 9.1480 |
+
+CLIC30 = `sorted(585 CLIC train .plr)[0::20][:30]`, 66 322 840 px (reconstruction of the set used for
+`chunk_model`; same pixel total). Screens and the per-image columns were re-run by Claude and match to 4 digits.
