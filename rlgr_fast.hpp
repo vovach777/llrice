@@ -26,7 +26,17 @@ inline uint64_t g_head = 0, g_nshrink = 0, g_lost_b = 0;
 #else
 #define RLGR_ST(x)
 #endif
-constexpr uint32_t MAX_K = 240, UP_K = 5, DOWN_K = 9, UP_K_DIRECT_RL = 2, DOWN_K_DIRECT_RL = 3, DOWN_K_RICE = 2;   // llrice
+// RLGR adaptation constants. LLRICE_RLGR_PRESET 0: tuned on CLIC photos (original Malvar 4, 6, 3, 3).
+// 1: screens, coordinate descent on 12 screens (6 gb82sc + 6 qoiweb), -10.6%; tuned on one half, the other half
+// gains -10.2% / -11.5%: runs on screens are long, so the run parameter has to grow fast (UP_K_DIRECT_RL 8).
+#ifndef LLRICE_RLGR_PRESET
+#define LLRICE_RLGR_PRESET 0
+#endif
+#if LLRICE_RLGR_PRESET == 1
+constexpr uint32_t MAX_K = 240, UP_K = 4, DOWN_K = 10, UP_K_DIRECT_RL = 8, DOWN_K_DIRECT_RL = 5, DOWN_K_RICE = 2;   // screens
+#else
+constexpr uint32_t MAX_K = 240, UP_K = 5, DOWN_K = 9, UP_K_DIRECT_RL = 2, DOWN_K_DIRECT_RL = 3, DOWN_K_RICE = 2;   // llrice, CLIC
+#endif
 
 struct PageBuf {                                    // encoder: grows on demand; decoder: the pages of the file
     std::vector<uint64_t> w; size_t top = 0;
@@ -114,10 +124,13 @@ inline uint32_t rice_get(Reader& s, uint32_t m) {
     s.skip(q + 1 + int(m)); return (uint32_t(q) << m) | low;
 }
 #endif
+// vk == 0: kr -= min(kr, DOWN_K_RICE); vk == 1: kept; else kr = min(kr + vk, MAX_K). Written without branches: vk is
+// data, a branch on it mispredicts about every other value and every miss flushes the other interleaved coders too.
 inline void adapt_kr(uint32_t& kr, uint32_t v, uint32_t kr_) {
     const uint32_t vk = v >> kr_;
-    if (vk == 0) kr -= kr > DOWN_K_RICE ? DOWN_K_RICE : kr;
-    else if (vk != 1) { kr += vk; if (kr > MAX_K) kr = MAX_K; }
+    const uint32_t add = vk & (0u - uint32_t(vk >= 2)), sub = (kr > DOWN_K_RICE ? DOWN_K_RICE : kr) & (0u - uint32_t(vk == 0));
+    const uint32_t t = kr + add;
+    kr = (t > MAX_K ? MAX_K : t) - sub;
 }
 
 struct Encoder {                                    // RLGR::Encoder of llrice, USE_MODEL_K off

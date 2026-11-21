@@ -43,6 +43,56 @@ LLRice is streming frendly intraframe lossless image compressor.
 | LLR Compression      | 2.3537       | 42.50           |
 | LLR Decompression    | 2.2845       | 43.78           |
 
+## Entropy engines (`LLRICE_ENGINE`)
+
+The predictor, the colour transform and the container are shared; `-DLLRICE_ENGINE=N` picks the
+entropy backend. Each engine writes its own revision nibble, so a stream can only be read by the
+engine that wrote it (a mismatch is rejected by the header CRC).
+
+| `N` | backend | notes |
+|-----|---------|-------|
+| 0 | RLGR | reference Microsoft-style Rice/Golomb adaptation |
+| 1 | RLGR fast | same bitstream, cheaper adaptation |
+| 2, 3, 5 | RLGR variants | page/lane/byte-chunk bitstream experiments |
+| 6 | RLH | (run class, value class) symbols, raw mantissas, static Huffman conditioned on the previous symbol |
+| **7** | **RLH7 fast** | RLH with retrained tables: 8 regimes × 14 contexts, trained regime selector |
+| **8** | **RLH7 strong** | RLH with retrained tables: 24 regimes × 34 contexts, trained regime selector |
+
+Engines 6/7/8 require `-DCODER=3`. Measured on this machine (gcc 12.2, `-O3 -DNDEBUG -march=native`,
+2 cores, best of repeated interleaved runs; **absolute MB/s are machine-specific**):
+
+**Screens — 12 images from `halic-wins-screen-p6`, 74 967 858 px**
+
+| engine | bits/pixel | vs RLGR | encode MB/s | decode MB/s |
+|--------|-----------|---------|-------------|-------------|
+| 0 RLGR | 1.6014 | – | 279.0 | 121.2 |
+| 1 RLGR fast | 1.6014 | – | 259.3 | 116.9 |
+| 6 RLH | 1.3604 | −15.05 % | 304.7 | 134.5 |
+| **7 RLH7 fast** | **1.3454** | **−15.99 %** | **308.9** | **135.5** |
+| **8 RLH7 strong** | **1.3123** | **−18.05 %** | 298.3 | 130.6 |
+
+**Photos — 117 CLIC test images, 271 140 751 px**
+
+| engine | bits/pixel | vs RLGR | encode MB/s | decode MB/s |
+|--------|-----------|---------|-------------|-------------|
+| 0 RLGR | 8.8448 | – | 78.5 | 51.3 |
+| 1 RLGR fast | 8.8448 | – | 81.3 | 47.6 |
+| 6 RLH | 8.8089 | −0.41 % | 127.8 | 64.1 |
+| **7 RLH7 fast** | 8.8316 | −0.15 % | 127.1 | 63.7 |
+| **8 RLH7 strong** | **8.7942** | **−0.57 %** | 125.3 | 61.0 |
+
+Static table footprint and construction time (`tools/rlh7/init_bench.cpp`, best of 5):
+
+| engine | `sizeof(GlobalTables)` | init |
+|--------|------------------------|------|
+| 6 | 4 842 928 B | 1.83 ms |
+| **7** | **2 003 888 B** | **0.82 ms** |
+| 8 | 14 495 664 B | 7.53 ms |
+
+Engine 7 is the drop-in choice: smaller and faster to initialise than 6, better on both corpora.
+Engine 8 trades ~3× the table memory and ~4× the init time for the best ratio. See
+[`tools/rlh7/README.md`](tools/rlh7/README.md) for how the tables are trained.
+
 ## Installation
 
 ### Prerequisites
