@@ -18,6 +18,12 @@ namespace RLGR {
     constexpr uint32_t DOWN_K_DIRECT_RL = 3;
     //constexpr uint32_t UP_K_RICE = 2;
     constexpr uint32_t DOWN_K_RICE = 2;
+    // vk == 0: kr -= min(kr, DOWN_K_RICE); vk == 1: kept; else kr = min(kr + vk, MAX_K); without data-dependent branches
+    inline void adapt_kr_vk(uint32_t& kr, uint32_t vk) {
+        const uint32_t add = vk & (0u - uint32_t(vk >= 2)), sub = (kr > DOWN_K_RICE ? DOWN_K_RICE : kr) & (0u - uint32_t(vk == 0));
+        const uint32_t t = kr + add;
+        kr = (t > MAX_K ? MAX_K : t) - sub;
+    }
     class Encoder {
         uint32_t rl=0;
         uint32_t k=1<<3;
@@ -103,14 +109,7 @@ namespace RLGR {
                     model.update( std::min(15, std20::bit_width(v)));
 #endif
                     uint32_t vk = (v) >> kr_;
-                    if (vk == 0) {
-                        kr -= kr > DOWN_K_RICE ? DOWN_K_RICE : kr;
-                    } else
-                    if (vk != 1) {
-                        kr += vk;
-                        if (kr > MAX_K)
-                            kr = MAX_K;
-                    }
+                    adapt_kr_vk(kr, vk);   // branchless, same result
                 }
             } else {
                 rl=0;
@@ -122,14 +121,7 @@ namespace RLGR {
 #endif
                 Rice::write(v,kr__,s);
                 uint32_t vk = v >> kr_;
-                if (vk == 0) {
-                    kr -= kr > DOWN_K_RICE ? DOWN_K_RICE : kr;
-                } else
-                if (vk != 1) {
-                    kr += vk;
-                    if (kr > MAX_K)
-                        kr = MAX_K;
-                }
+                adapt_kr_vk(kr, vk);   // branchless, same result
                 if (v == 0) {
                     k += UP_K_DIRECT_RL;
                     if (k > MAX_K)
@@ -195,13 +187,7 @@ namespace RLGR {
     #endif
             auto rl_val = Rice::read(kr__, s);
             uint32_t vk = rl_val >> kr_;
-            if (vk == 0) {
-                kr -= kr > DOWN_K_RICE ? DOWN_K_RICE : kr;
-            } else if (vk != 1) {
-                kr += vk;
-                if (kr > MAX_K)
-                    kr = MAX_K;
-            }
+            adapt_kr_vk(kr, vk);   // branchless, same result
     #ifdef USE_MODEL_K
             model.update(std::min(15, std20::bit_width(rl_val)));
     #endif

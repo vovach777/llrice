@@ -114,10 +114,13 @@ inline uint32_t rice_get(Reader& s, uint32_t m) {
     s.skip(q + 1 + int(m)); return (uint32_t(q) << m) | low;
 }
 #endif
+// vk == 0: kr -= min(kr, DOWN_K_RICE); vk == 1: kept; else kr = min(kr + vk, MAX_K). Written without branches: vk is
+// data, a branch on it mispredicts about every other value and every miss flushes the other interleaved coders too.
 inline void adapt_kr(uint32_t& kr, uint32_t v, uint32_t kr_) {
     const uint32_t vk = v >> kr_;
-    if (vk == 0) kr -= kr > DOWN_K_RICE ? DOWN_K_RICE : kr;
-    else if (vk != 1) { kr += vk; if (kr > MAX_K) kr = MAX_K; }
+    const uint32_t add = vk & (0u - uint32_t(vk >= 2)), sub = (kr > DOWN_K_RICE ? DOWN_K_RICE : kr) & (0u - uint32_t(vk == 0));
+    const uint32_t t = kr + add;
+    kr = (t > MAX_K ? MAX_K : t) - sub;
 }
 
 struct Encoder {                                    // RLGR::Encoder of llrice, USE_MODEL_K off
