@@ -88,6 +88,11 @@
 #define TRUNC_SPLIT 1
 #endif
 //#define USE_NEW_LINE
+// LLRICE_RCT_FNBLI 1: the colour transform of fNBLI / PALIC: Y = G + ((U + V + 2) >> 2), then V -= U >> 2 (V stays -255..255).
+#ifndef LLRICE_RCT_FNBLI
+#define LLRICE_RCT_FNBLI 0
+#endif
+#define LLRICE_RCT_RND (LLRICE_RCT_FNBLI ? 2 : 0)
 namespace llrice
 {
     constexpr inline auto ext = ".llr";
@@ -309,7 +314,8 @@ void LOCO_I(Load && load, size_t width, size_t height) {
             for (uint32_t i = 0; i < width; ++i) {
                 curr_line[0][i] -= curr_line[1][i];
                 curr_line[2][i] -= curr_line[1][i];
-                curr_line[1][i] += (curr_line[0][i] + curr_line[2][i]) >> 2;
+                curr_line[1][i] += (curr_line[0][i] + curr_line[2][i] + LLRICE_RCT_RND) >> 2;
+                if (LLRICE_RCT_FNBLI) curr_line[2][i] -= curr_line[0][i] >> 2;
             }
             #define RLGR_ROW_ENC(C, ENC)                                                          \
             {                                                                                     \
@@ -342,7 +348,8 @@ void LOCO_I(Load && load, size_t width, size_t height) {
                     for (int i = 0; i <16; ++i) {
                         curr_line[0][i+w] -= curr_line[1][i+w];
                         curr_line[2][i+w] -= curr_line[1][i+w];
-                        curr_line[1][i+w] += (curr_line[0][i+w] + curr_line[2][i+w]) >> 2;
+                        curr_line[1][i+w] += (curr_line[0][i+w] + curr_line[2][i+w] + LLRICE_RCT_RND) >> 2;
+                        if (LLRICE_RCT_FNBLI) curr_line[2][i+w] -= curr_line[0][i+w] >> 2;
                     }
 
                     if (likely(w>0 && h>0)) {
@@ -413,7 +420,8 @@ void LOCO_I(Load && load, size_t width, size_t height) {
                     for (int i = 0; i < widthR; ++i) {
                         curr_line[0][i+w] -= curr_line[1][i+w];
                         curr_line[2][i+w] -= curr_line[1][i+w];
-                        curr_line[1][i+w] += (curr_line[0][i+w] + curr_line[2][i+w]) >> 2;
+                        curr_line[1][i+w] += (curr_line[0][i+w] + curr_line[2][i+w] + LLRICE_RCT_RND) >> 2;
+                        if (LLRICE_RCT_FNBLI) curr_line[2][i+w] -= curr_line[0][i+w] >> 2;
                     }
 
                     if (likely(w>0 && h>0)) {
@@ -565,7 +573,7 @@ void LOCO_I(Load && load, size_t width, size_t height) {
             #undef RLGR_ROW_DEC
             for (uint32_t i = 0; i < width; ++i) {
                 T r = curr_line[0][i], g = curr_line[1][i], b = curr_line[2][i];
-                g -= (r+b) >> 2; r += g; b += g;
+                if (LLRICE_RCT_FNBLI) b += r >> 2; g -= (r + b + LLRICE_RCT_RND) >> 2; r += g; b += g;
                 store(static_cast<UT>(r),static_cast<UT>(g),static_cast<UT>(b));
             }
 #else
@@ -639,7 +647,8 @@ void LOCO_I(Load && load, size_t width, size_t height) {
                         T r = curr_line[0][w+i];
                         T g = curr_line[1][w+i];
                         T b = curr_line[2][w+i];
-                        g -= (r+b) >> 2;
+                        if (LLRICE_RCT_FNBLI) b += r >> 2;
+                        g -= (r + b + LLRICE_RCT_RND) >> 2;
                         r += g;
                         b += g;
                         store(static_cast<UT>(r),static_cast<UT>(g),static_cast<UT>(b));
@@ -714,7 +723,8 @@ void LOCO_I(Load && load, size_t width, size_t height) {
                         T r = curr_line[0][w+i];
                         T g = curr_line[1][w+i];
                         T b = curr_line[2][w+i];
-                        g -= (r+b) >> 2;
+                        if (LLRICE_RCT_FNBLI) b += r >> 2;
+                        g -= (r + b + LLRICE_RCT_RND) >> 2;
                         r += g;
                         b += g;
                         store(static_cast<UT>(r),static_cast<UT>(g),static_cast<UT>(b));

@@ -36,6 +36,9 @@ namespace rlh9
     constexpr int NV = 44, NR = 19, NSYM = NR * NV + 1, EOB = NSYM - 1, MAXL = 15;
     constexpr int KR_SHIFT = 2, KR_MAX = 15, NCTX = (KR_MAX + 1) * 3, NGRP = 2, TOTC = NGRP * NCTX;
     constexpr uint32_t MAX_W = 16383;
+#ifndef RLH9_RCT
+#define RLH9_RCT 1     // 1 (R8F1): fNBLI colour, Y=G+((U+V+2)>>2), then V -= U>>2 (V stays -255..255); 0: old RCT, needs other tables
+#endif
 #ifndef RLH9_LUTB
 #define RLH9_LUTB 9
 #endif
@@ -117,7 +120,12 @@ namespace rlh9
                 uint16_t *U0 = u + size_t(r) * W, *U1 = U0 + PS, *U2 = U1 + PS;
                 int a0 = 0, a1 = 0, a2 = 0;
                 for (int x = 0; x < W; ++x) {
-                    const int R = s[3 * x], G = s[3 * x + 1], B = s[3 * x + 2], U = R - G, V = B - G, Y = G + ((U + V) >> 2);
+                    const int R = s[3 * x], G = s[3 * x + 1], B = s[3 * x + 2], U = R - G;
+#if RLH9_RCT == 1
+                    const int Y = G + ((U + (B - G) + 2) >> 2), V = (B - G) - (U >> 2);
+#else
+                    const int V = B - G, Y = G + ((U + V) >> 2);
+#endif
                     C0[x] = int16_t(Y); C1[x] = int16_t(U); C2[x] = int16_t(V);
                     int p0, p1, p2;
                     if (y == 0) { p0 = a0; p1 = a1; p2 = a2; }
@@ -184,6 +192,11 @@ namespace rlh9
     }
 
     // ---------------- decoder ----------------
+#if RLH9_RCT == 1
+#define RLH9_OUT(O, Y_, U_, V_) do { const int v_ = (V_) + ((U_) >> 2), g_ = (Y_) - (((U_) + v_ + 2) >> 2); (O)[0] = uint8_t((U_) + g_); (O)[1] = uint8_t(g_); (O)[2] = uint8_t(v_ + g_); } while (0)
+#else
+#define RLH9_OUT(O, Y_, U_, V_) do { const int g_ = (Y_) - (((U_) + (V_)) >> 2); (O)[0] = uint8_t((U_) + g_); (O)[1] = uint8_t(g_); (O)[2] = uint8_t((V_) + g_); } while (0)
+#endif
     inline uint64_t peek(const uint8_t* base, uint64_t pos) { uint64_t w; std::memcpy(&w, base + (pos >> 3), 8); return __builtin_bswap64(w) << (pos & 7); }
     __attribute__((noinline, cold)) inline SlowSym decode_slow(const Tables& T, uint32_t tc, uint64_t w, bool& bad) {
         for (int l = 1; l <= MAXL; ++l) {
@@ -266,18 +279,18 @@ namespace rlh9
                 if (y == 0) { a0 = uz(U0[0]); a1 = uz(U1[0]); a2 = uz(U2[0]); }
                 else { a0 = Q0[0] + uz(U0[0]); a1 = Q1[0] + uz(U1[0]); a2 = Q2[0] + uz(U2[0]); }
                 C0[0] = int16_t(a0); C1[0] = int16_t(a1); C2[0] = int16_t(a2);
-                { const int g = a0 - ((a1 + a2) >> 2); o[0] = uint8_t(a1 + g); o[1] = uint8_t(g); o[2] = uint8_t(a2 + g); }
+                { RLH9_OUT(o, a0, a1, a2); }
                 if (y == 0) {
                     for (int x = 1; x < W; ++x) {
                         a0 += uz(U0[x]); a1 += uz(U1[x]); a2 += uz(U2[x]);
                         C0[x] = int16_t(a0); C1[x] = int16_t(a1); C2[x] = int16_t(a2);
-                        const int g = a0 - ((a1 + a2) >> 2); o[3 * x] = uint8_t(a1 + g); o[3 * x + 1] = uint8_t(g); o[3 * x + 2] = uint8_t(a2 + g);
+                        RLH9_OUT(o + 3 * x, a0, a1, a2);
                     }
                 } else {
                     for (int x = 1; x < W; ++x) {
                         a0 = med(a0, Q0[x], Q0[x - 1]) + uz(U0[x]); a1 = med(a1, Q1[x], Q1[x - 1]) + uz(U1[x]); a2 = med(a2, Q2[x], Q2[x - 1]) + uz(U2[x]);
                         C0[x] = int16_t(a0); C1[x] = int16_t(a1); C2[x] = int16_t(a2);
-                        const int g = a0 - ((a1 + a2) >> 2); o[3 * x] = uint8_t(a1 + g); o[3 * x + 1] = uint8_t(g); o[3 * x + 2] = uint8_t(a2 + g);
+                        RLH9_OUT(o + 3 * x, a0, a1, a2);
                     }
                 }
                 for (int p = 0; p < 3; ++p) std::swap(prev[p], cur[p]);

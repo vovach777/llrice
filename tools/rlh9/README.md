@@ -19,7 +19,11 @@ Measured (Claude's sandbox, Xeon ~3.8 GHz, -r 3, 49 held-out CLIC photos):
 |---|---|---|---|
 | E7 | 9.0704 | 162 | 88.5 |
 | E8 | 9.0331 | 161 | 82.7 |
-| E9 | 9.0006 | 152 | 177 |
-Screens are not a target: 12 classic screens E8 1.3123, E9 1.4586 bpp (photo-only tables, no regimes).
+| E9 (old RCT, e1ddfed) | 9.0006 | 152 | 177 |
+| E9 (fNBLI colour, R8F1 now) | 8.9807 | 150 | 172 |
+Colour: the fNBLI / PALIC transform (Y = G + ((U+V+2)>>2), then V -= U>>2; V stays -255..255): -0.22% on photos.
+The same transform for the RLGR / RLH7 path is the option LLRICE_RCT_FNBLI (default 0): photos E1 -0.20%,
+E7 -0.24%, E8 -0.24%; 12 screens +0.4% worse.
+Screens are not a target: 12 classic screens E8 1.3123, E9 1.4647 bpp (photo-only tables, no regimes).
 Checks: round trip 49 photos + 33 edge sizes ok; E0..E8 encoder output byte-identical before/after (54 files);
 corrupt-stream fuzz under ASan/UBSan (10k mutations): decoder throws or decodes, no memory errors.
