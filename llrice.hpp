@@ -30,6 +30,8 @@
 //       hole of the same coder even if other coders wrote after it; the size of 1/2, no pages (rev '4');
 //   5 - rlgr_bytes.hpp: every stream owns byte chunks of variable size cut from one shared byte head at the llrice
 //       reservation points; no pages, no holes, the bit position only inside the stream (rev '5').
+//   9 - rlh9.hpp: RLH8 superscalar photo codec R8F1 (8-row bands, 3 plane lanes decoded token-interleaved, implicit
+//       RLGR-state context, static Huffman); 8-bit RGB only; its own body after the llrice header (rev '9').
 // LLRICE_FAST=0 is the old spelling of LLRICE_ENGINE=0. USE_SIMPLE_RLGR, USE_MODEL_K and USE_NEW_LINE need 0.
 #ifndef LLRICE_ENGINE
 #if (defined(LLRICE_FAST) && LLRICE_FAST == 0) || defined(USE_SIMPLE_RLGR) || defined(USE_MODEL_K) || defined(USE_NEW_LINE)
@@ -76,6 +78,10 @@
 #define RLH7_MODE 1
 #include "rlh7.hpp"
 #endif
+#if LLRICE_ENGINE == 9
+#include "rlgr_fast.hpp"   // only so that the RLGR paths keep compiling; ENGINE 9 does not use them
+#include "rlh9.hpp"
+#endif
 // CODER_G_RB_SUM: r in 0..rb (rb + 1 values). TRUNC_SPLIT 1: truncated binary, k = floor(log2(rb + 1)) bits if
 // r < u = 2^(k+1) - (rb + 1), else k + 1 bits of r + u (no code is wasted). 0: bit_width(rb) bits (old format).
 #ifndef TRUNC_SPLIT
@@ -98,8 +104,8 @@ namespace llrice
 #endif
         using RawW = BitStream::Writer; using RawR = BitStream::Reader;
     };
-#if LLRICE_ENGINE == 1 || LLRICE_ENGINE == 2 || LLRICE_ENGINE == 6 || LLRICE_ENGINE == 7 || LLRICE_ENGINE == 8
-#if LLRICE_ENGINE == 1
+#if LLRICE_ENGINE == 1 || LLRICE_ENGINE == 2 || LLRICE_ENGINE == 6 || LLRICE_ENGINE == 7 || LLRICE_ENGINE == 8 || LLRICE_ENGINE == 9
+#if LLRICE_ENGINE == 1 || LLRICE_ENGINE == 9   // 9: the RLGR paths only have to compile
     namespace fast_ns = rlgrf;
 #elif LLRICE_ENGINE == 2
     namespace fast_ns = rlgrz;
@@ -738,6 +744,16 @@ void LOCO_I(Load && load, size_t width, size_t height) {
         hdr.flags |= uint16_t(1u << 14);   // per-channel page pools
 #endif
         hdr.protect();
+#if LLRICE_ENGINE == 9
+        if (img.channel_type != RawImage::ChannelType::uint8 || img.channel_nb != 3) throw std::runtime_error("ENGINE 9: 8-bit RGB only");
+        {
+            const auto body = rlh9::encode(img.as<uint8_t>(), int(hdr.width), int(hdr.height));
+            std::vector<uint64_t> out(2 + (body.size() + 7) / 8, 0);
+            std::memcpy(out.data(), &hdr, sizeof(Header));
+            if (!body.empty()) std::memcpy(out.data() + 2, body.data(), body.size());
+            return out;
+        }
+#endif
 #if defined(RLGR_POOL3)
         rlgrf::PageBuf pg, pr, pb;
         const size_t guess = size_t(hdr.width) * hdr.height / 24 + 1024;
@@ -854,6 +870,15 @@ void LOCO_I(Load && load, size_t width, size_t height) {
         //RawImage::ChannelType::uint16be  pnm freadly
         img.channel_type = hdr.channels_depth <= 8 ? RawImage::ChannelType::uint8 : RawImage::ChannelType::uint16be;
         img.allocate();
+#if LLRICE_ENGINE == 9
+        if (img.channel_type != RawImage::ChannelType::uint8) throw std::runtime_error("ENGINE 9: 8-bit RGB only");
+        {
+            const size_t nbody = (poolvec.size() - 2) * 8;
+            poolvec.resize(poolvec.size() + (rlh9::decode_pad(int(img.width)) + 15) / 8, 0);   // zero tail for the bit peeks
+            rlh9::decode(reinterpret_cast<const uint8_t*>(poolvec.data() + 2), nbody, img.as<uint8_t>(), int(img.width), int(img.height));
+            return img;
+        }
+#endif
 #if defined(RLGR_POOL3)
         if (!(hdr.flags & (1u << 14))) throw std::runtime_error("not a per-channel-pool stream");
         if (poolvec.size() < 3) throw std::runtime_error("truncated file");
