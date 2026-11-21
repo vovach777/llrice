@@ -1,19 +1,22 @@
-# ENGINE 9 (rlh9.hpp): RLH8 superscalar codec, format R8F3
+# ENGINE 9 (rlh9.hpp): RLH8 superscalar codec, format R8F4
 
 Build: `g++ -O3 -DNDEBUG -march=native -std=c++17 -DLLRICE_ENGINE=9 -DCODER=3 bench.cpp` (signature rev '9').
 8-bit RGB only, width <= 16383. Design: Argon (rlh8f, split micro-FSM, dual tables, R8F3 geometry, 2026-11-21/22) on
-Claude's RLH8s prototype; history in the lab journal 01c. Build tag: `llrice ENGINE=9 CODER=3 FMT=R8F3 RCT=rct`.
+Claude's RLH8s prototype; history in the lab journal 01c. Build tag: `llrice ENGINE=9 CODER=3 FMT=R8F4 RCT=rct`.
 
 Format: llrice header, then per 16-row band: 4 x u32 lane byte sizes (bit 31 of the first = screen table set) + 4 lane
 byte streams: Y rows 0..m-1, Y rows m..nb-1, S rows 0..m-1, S rows m..nb-1 (m = nb / 2).
 Planes: RCT U = R-G, V = B-G, Y = G + ((U+V)>>2); MED per plane; zigzag. Chroma is one plane S = zU + zV (0..2040);
-after every non-zero S token the lane carries zU in 0..S as a truncated binary code (zV = S - zU).
+after every non-zero S token the lane carries zU in 0..S (zV = S - zU): for S <= 15 a static Huffman code (<= 6 bits)
+per table set and S (RemLUT, Argon: the zigzag parity of S carries the sign agreement of eU, eV, so zU | S is far from
+uniform at small S), for S >= 16 a truncated binary code.
 Each band row of a plane is one chunk (EOB = rest of the row is zero). Tokens: 19 run classes x 44 quarter-octave value
 classes + EOB (837).
 Context per lane: split micro-FSM, st = sv | sr << 6 (sv: 48 states by the half-octave value class, calibrated on llrice
 adapt_kr; sr: 16 states, EMA 1/4 of the run class, table listed literally). ctx (48 per group): photo set
 (sv >> 1) * 2 + (sr >> 3), screen set (sv >> 2) * 4 + (sr >> 2). State (12, 0) at the start of every lane of every band.
-Tables: 2 sets (photo, screen) x 2 groups (Y, S) x 48 = 192 static canonical Huffman tables (<= 15 bits).
+Tables: 2 sets (photo, screen) x 2 groups (Y, S) x 48 = 192 static canonical Huffman tables (<= 15 bits),
+plus 2 x 15 zU | S codes (RLH9_REMLEN).
 The encoder takes the screen set when >= RLH9_ZTHR % (65) of the band's Y, U, V residuals are zero.
 Decoder: entropy pass of a band with the 4 lanes interleaved one token per lane per round (packed 32-bit LUT, 9-bit
 index, a class byte per LUT entry gives the next state, zU read branch-free from the same 64-bit window), then per
@@ -33,10 +36,14 @@ Measured (Claude's sandbox, Xeon ~3.8 GHz, 1 thread, -r 3):
 | PLS (plt2 palic-2r -s) | 8.8988 / 323 | 1.2914 / 661 | 1.9455 / 635 |
 | E8 | 9.0331 / 86 | 1.3123 / 274 | 1.9497 / 217 |
 | E9 R8F2 (8-row bands, Y/U/V lanes, fNBLI, scalar MED) | 8.9882 / 217 | 1.3154 / 524 | 1.9738 / 487 |
-| E9 R8F3 (now) | 9.0112 / 296 | 1.2670 / 942 | 1.9427 / 838 |
+| E9 R8F3 (zU always truncated binary) | 9.0112 / 296 | 1.2670 / 942 | 1.9427 / 838 |
+| E9 R8F4 (now, RemLUT for S <= 15) | 8.9734 / 284 | 1.2640 / 917 | 1.9370 / 827 |
 | R8F3 with fNBLI colour | 9.0167 / 291 | 1.2720 / 937 | 1.9475 / 857 |
 With S = zU + zV the fNBLI step V -= U>>2 no longer helps, so R8F3 uses the plain RCT (RLH9_RCT=0).
-Photos +0.26% vs R8F2 (Argon measured -0.24% for S with 20-photo tables and the plain RCT on both sides).
+R8F3 lost +0.26% on photos vs R8F2; the RemLUT takes it back: R8F4 is -0.16% vs R8F2 on photos, -0.42% vs R8F3, for 3-4% of decode speed.
+Why S works (Argon, chroma_mix reply): H(S) + H(zU|S) = H(zU, zV); U = R-G and V = B-G share -G, so the signs of eU, eV
+agree in 69% of the photo pixels where both are non-zero, and the parity of S codes that for free; fNBLI and YCoCg-R
+remove this correlation, max(zU, zV) and |eU| + |eV| + signs lose to the sum.
 Checks: round trip of all three sets; 96 edge cases under ASan/UBSan with SIMD and with -DRLH9_NO_SIMD; 168 long-run
 cases (runs up to 16382, widths 8200..16383); corrupt-stream fuzz 2 x 5000 mutations under ASan/UBSan; R8F2 and R8F3
 files reject each other by the build tag. E0..E8 are not touched.

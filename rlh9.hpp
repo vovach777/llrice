@@ -1,9 +1,9 @@
-// rlh9.hpp - LLRICE_ENGINE 9: RLH8 superscalar codec, format R8F3 (signature rev '9').
+// rlh9.hpp - LLRICE_ENGINE 9: RLH8 superscalar codec, format R8F4 (signature rev '9').
 // Design: Argon (rlh8f.cpp, split micro-FSM, dual tables, R8F3 geometry, 2026-11-21/22) on top of Claude's RLH8s prototype.
 //
 // Front end: RCT (U = r-g, V = b-g, Y = g + ((U+V)>>2); RLH9_RCT 1: fNBLI), MED per plane (row 0: left,
 //          column 0: top), zigzag. Chroma is coded as one plane S = zU + zV (0..2040) plus zU in 0..S as a truncated
-//          binary code right after every non-zero S token (zV = S - zU).
+//          code right after every non-zero S token (zV = S - zU).
 // Geometry: 16-row bands; each band row of a plane is one chunk of width W; EOB = "rest of this row is zero".
 // Lanes: 4 independent byte streams per band: Y rows 0..m-1, Y rows m..nb-1, S rows 0..m-1, S rows m..nb-1, m = nb / 2;
 //          band header = 4 x u32 lane byte sizes; bit 31 of the first = screen table set.
@@ -13,7 +13,8 @@
 //          photos (sv >> 1) * 2 + (sr >> 3), screens (sv >> 2) * 4 + (sr >> 2).
 //          The next state depends on the Huffman symbol only, so the decoder takes it from a byte table next to the LUT,
 //          in parallel with the mantissa work. State (sv 12, sr 0) at the start of every lane of every band.
-// Tables: 2 sets (photo, screen) x 2 groups (Y, S) x 48 = 192 static canonical Huffman tables (<= 15 bits).
+// Tables: 2 sets (photo, screen) x 2 groups (Y, S) x 48 = 192 static canonical Huffman tables (<= 15 bits); per set
+//          and S = 1..15 a static code (<= 6 bits) for zU | S (RemLUT, Argon); S >= 16: truncated binary.
 //          The encoder picks screen tables when >= RLH9_ZTHR % of the band's Y, U, V residuals are zero (encoder-only knob).
 // Decoder: per band an entropy pass with the 4 lanes interleaved ONE TOKEN per lane per round (packed 32-bit LUT,
 //          one LUT load + one class-byte load per token, the zU split read branch-free from the same 64-bit window),
@@ -61,10 +62,11 @@ namespace rlh9
 #endif
     constexpr int LUTB = RLH9_LUTB;      // decoder-only knob, the format does not depend on it
 #ifndef RLH9_NO_TABLES
-    static_assert(RLH9_NSYM == NSYM && RLH9_TOTC == TOTC, "rlh9_tables.h does not match rlh9.hpp");
+    static_assert(RLH9_NSYM == NSYM && RLH9_TOTC == TOTC && RLH9_REMS == 15, "rlh9_tables.h does not match rlh9.hpp");
 #endif
 
     constexpr int HB = 16, NLANE = 4;
+    constexpr int REMS = 15, REMB = 6;   // zU | S for S <= REMS: static Huffman per set and S, codes <= REMB bits (RemLUT, Argon)
     // half-octave value class 0..15 (a function of the quarter-octave class only), run class min(bw(run), 7)
     inline int hoct_v(uint32_t v) { if (v <= 1) return 0; const int b = bw(v); if (b >= 9) return 15; return 2 * b - 3 + int((v >> (b - 2)) & 1u); }
     inline int rcls(uint32_t rl) { const int b = bw(rl); return b > 7 ? 7 : b; }
@@ -104,9 +106,30 @@ namespace rlh9
         uint8_t lut_cls[TOTC][1 << LUTB];                // rc << 4 | vh of the same entry: drives the state automaton
         uint16_t first[TOTC][MAXL + 2], cntl[TOTC][MAXL + 2], offs[TOTC][MAXL + 2], sorted[TOTC][NSYM];
         SlowSym si[NSYM];
+        uint8_t rem_len[NSET][REMS + 1][REMS + 1];
+        uint16_t rem_cw[NSET][REMS + 1][REMS + 1];        // code | len << 8
+        uint16_t rem_lut[NSET][REMS + 1][1 << REMB];      // zU | len << 8 (row S = 0 unused)
         struct VEnc { uint8_t cv, vm, vh; uint16_t vman; } venc[2048];
         struct REnc { uint8_t rs, rm, rc; uint16_t rman; } renc[256];
 
+        // rl: NSET x (REMS+1) x (REMS+1) code lengths of zU in 0..S (rows S = 1..REMS), each row a complete prefix code
+        void build_rem(const uint8_t* rl) {
+            std::memset(rem_cw, 0, sizeof rem_cw); std::memset(rem_lut, 0, sizeof rem_lut);
+            for (int t = 0; t < NSET; ++t) for (int S = 1; S <= REMS; ++S) {
+                uint32_t c = 0, kraft = 0;
+                for (int z = 0; z <= S; ++z) { rem_len[t][S][z] = rl[(t * (REMS + 1) + S) * (REMS + 1) + z]; const int l = rem_len[t][S][z];
+                    if (l < 1 || l > REMB) throw std::runtime_error("rlh9: bad rem table"); kraft += 1u << (REMB - l); }
+                if (kraft != 1u << REMB) throw std::runtime_error("rlh9: incomplete rem table");
+                for (int l = 1; l <= REMB; ++l) {
+                    for (int z = 0; z <= S; ++z) if (rem_len[t][S][z] == l) {
+                        rem_cw[t][S][z] = uint16_t(c | uint32_t(l) << 8);
+                        for (uint32_t k = c << (REMB - l); k < (c + 1) << (REMB - l); ++k) rem_lut[t][S][k] = uint16_t(z | l << 8);
+                        ++c;
+                    }
+                    c <<= 1;
+                }
+            }
+        }
         void build(const uint8_t* packed_len) {          // packed_len: TOTC x ceil(NSYM/2) nibbles, low nibble first
             constexpr int PB = (NSYM + 1) / 2;
             for (int tc = 0; tc < TOTC; ++tc) for (int s = 0; s < NSYM; ++s) { const uint8_t b = packed_len[tc * PB + s / 2]; len[tc][s] = uint8_t(s & 1 ? b >> 4 : b & 15); }
@@ -145,7 +168,7 @@ namespace rlh9
         }
     };
 #ifndef RLH9_NO_TABLES
-    inline const Tables& tables() { static const Tables* t = [] { auto* p = new Tables; p->build(&RLH9_LEN[0][0]); return p; }(); return *t; }
+    inline const Tables& tables() { static const Tables* t = [] { auto* p = new Tables; p->build(&RLH9_LEN[0][0]); p->build_rem(&RLH9_REMLEN[0][0][0]); return p; }(); return *t; }
 #else
     const Tables& tables();
 #endif
@@ -214,7 +237,7 @@ namespace rlh9
     // lane l of a band of nb rows: plane (0 = Y, 1 = S) and rows [r0, r1)
     inline void lane_rows(int l, int nb, int& plane, int& r0, int& r1) { const int m = nb / 2; plane = l >> 1; r0 = (l & 1) ? m : 0; r1 = (l & 1) ? nb : m; }
 
-    // encode the R8F3 body (no file header) of a W x H 8-bit RGB image
+    // encode the R8F4 body (no file header) of a W x H 8-bit RGB image
     inline std::vector<uint8_t> encode(const uint8_t* rgb, int W, int H) {
         if (W <= 0 || H <= 0 || uint32_t(W) > MAX_W) throw std::runtime_error("rlh9: width must be 1..16383");
         const Tables& T = tables();
@@ -236,7 +259,11 @@ namespace rlh9
                     const uint16_t* row = P + size_t(r) * W; const uint16_t* rowu = PU + size_t(r) * W;
                     walk_row(T, row, W, gb, sc, st, [&](uint32_t tc, int s, uint64_t m, int nm, int x) {
                         const uint32_t cw = T.enc_cw[tc][s]; w.put(cw & 0xFFFFu, int(cw >> 16)); if (nm) w.put(m, nm);
-                        if (plane && x >= 0) w.put_tbin(rowu[x], uint32_t(row[x]) + 1u);
+                        if (plane && x >= 0) {
+                            const uint32_t sv = row[x];
+                            if (sv <= uint32_t(REMS)) { const uint32_t rc = T.rem_cw[sc][sv][rowu[x]]; w.put(rc & 255u, int(rc >> 8)); }
+                            else w.put_tbin(rowu[x], sv + 1u);
+                        }
                     });
                 }
                 ls[l] = uint32_t(w.flush() - lb[l].data());
@@ -266,7 +293,7 @@ namespace rlh9
         uint32_t s0 = ST0, s1 = ST0, s2 = ST0, s3 = ST0;
         uint32_t q0 = 0, qe0 = W, q1 = MW, qe1 = MW + W, q2 = PS, qe2 = PS + W, q3 = PS + MW, qe3 = PS + MW + W;
         const uint32_t e0 = MW, e1 = PS, e2 = PS + MW, e3 = 2 * PS, gy = sc * SETC, gs = gy + NCTX, cm = ctx_m(sc), cc = ctx_c(sc);
-        const uint32_t* const lut = &T.lut[0][0]; const uint8_t* const lcl = &T.lut_cls[0][0]; bool bad = false;
+        const uint32_t* const lut = &T.lut[0][0]; const uint8_t* const lcl = &T.lut_cls[0][0]; const uint16_t* const rlut = &T.rem_lut[sc][0][0]; bool bad = false;
         const Fsm& M = fsm();
 #define RLH9_HEAD(POS, ST, GB) \
         const uint64_t w_ = peek(base, POS); \
@@ -299,12 +326,18 @@ namespace rlh9
             } \
         } \
         RLH9_TAIL(Q, QE) } while (0)
-        // S lane: after the S token, zU = tbin(S + 1) from the same window (<= 9 + 20 + 11 bits on the fast path)
+        // S lane: after the S token, zU from the same window (<= 9 + 20 + 11 bits on the fast path):
+        // S <= REMS: RemLUT (6-bit index), else truncated binary of S + 1 values
 #define RLH9_TBIN(WIN, SV, USED, POS, Q) \
-            const uint32_t mm_ = (SV) + 1u, k_ = 31u - uint32_t(__builtin_clz(mm_)), t_ = (2u << k_) - mm_; \
-            const uint32_t v2_ = uint32_t(((WIN) << (USED)) >> (63u - k_)), v1_ = v2_ >> 1, ge_ = uint32_t(v1_ >= t_); \
-            POS += k_ + ge_; \
-            const uint32_t uv_ = ge_ ? v2_ - t_ : v1_; \
+            uint32_t uv_; \
+            if (__builtin_expect((SV) <= uint32_t(REMS), 1)) { \
+                const uint32_t re_ = rlut[((SV) << REMB) | uint32_t(((WIN) << (USED)) >> (64 - REMB))]; \
+                POS += re_ >> 8; uv_ = re_ & 255u; \
+            } else { \
+                const uint32_t mm_ = (SV) + 1u, k_ = 31u - uint32_t(__builtin_clz(mm_)), t_ = (2u << k_) - mm_; \
+                const uint32_t v2_ = uint32_t(((WIN) << (USED)) >> (63u - k_)), v1_ = v2_ >> 1, ge_ = uint32_t(v1_ >= t_); \
+                POS += k_ + ge_; uv_ = ge_ ? v2_ - t_ : v1_; \
+            } \
             u[Q] = uint16_t(uv_); u[Q + PS] = uint16_t((SV) - uv_); ++Q;
 #define RLH9_STEP_S(POS, ST, Q, QE) do { RLH9_HEAD(POS, ST, gs) \
         if (__builtin_expect((e_ & 15u) != 0, 1)) { \
@@ -444,7 +477,7 @@ namespace rlh9
         }
     }
 
-    // decode an R8F3 body of n bytes; the buffer must have 8 readable zero bytes after n plus slack (see decode_pad)
+    // decode an R8F4 body of n bytes; the buffer must have 8 readable zero bytes after n plus slack (see decode_pad)
     inline size_t decode_pad(int W) { return size_t(W) * HB * 2 * 6 + 64; }
     inline void decode(const uint8_t* base, size_t n, uint8_t* rgb, int W, int H) {
         if (W <= 0 || H <= 0 || uint32_t(W) > MAX_W) throw std::runtime_error("rlh9: bad size");
@@ -478,7 +511,7 @@ namespace rlh9
     }
 
     // ---------------- training (tools/rlh9) ----------------
-    struct Counts { std::vector<double> c = std::vector<double>(size_t(TOTC) * NSYM, 0.0); };
+    struct Counts { std::vector<double> c = std::vector<double>(size_t(TOTC) * NSYM, 0.0), rem = std::vector<double>(size_t(NSET) * (REMS + 1) * (REMS + 1), 0.0); };
     // counts per (set, group, ctx, sym); force < 0: band class by the encoder detector, else that set; wt: weight per token
     inline void count(Counts& C, const uint8_t* rgb, int W, int H, int force = -1, double wt = 1.0, uint64_t* nband = nullptr) {
         static Tables* T0 = [] { auto* p = new Tables; p->enc_luts(); return p; }();
@@ -491,8 +524,13 @@ namespace rlh9
             for (int l = 0; l < NLANE; ++l) {
                 int plane, r0, r1; lane_rows(l, nb, plane, r0, r1); uint32_t st = ST0;
                 const uint16_t* Pl = bu.data() + (plane ? 3 * PS : 0);
-                for (int r = r0; r < r1; ++r)
-                    walk_row(*T0, Pl + size_t(r) * W, W, sc * SETC + uint32_t(plane) * NCTX, sc, st, [&](uint32_t tc, int s, uint64_t, int, int) { C.c[size_t(tc) * NSYM + s] += wt; });
+                for (int r = r0; r < r1; ++r) {
+                    const uint16_t* row = Pl + size_t(r) * W; const uint16_t* rowu = bu.data() + PS + size_t(r) * W;
+                    walk_row(*T0, row, W, sc * SETC + uint32_t(plane) * NCTX, sc, st, [&](uint32_t tc, int s, uint64_t, int, int x) {
+                        C.c[size_t(tc) * NSYM + s] += wt;
+                        if (plane && x >= 0 && row[x] <= REMS) C.rem[(size_t(sc) * (REMS + 1) + row[x]) * (REMS + 1) + rowu[x]] += wt;
+                    });
+                }
             }
         }
     }

@@ -8,6 +8,7 @@
 #define RLH9_NO_TABLES
 #define RLH9_NSYM 837
 #define RLH9_TOTC 192
+#define RLH9_REMS 15
 #include "rlh9.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -72,6 +73,19 @@ int main(int argc, char** argv) {
         fprintf(o, "{");
         for (int b = 0; b < PB; ++b) { const int lo = L[2 * b], hi = 2 * b + 1 < rlh9::NSYM ? L[2 * b + 1] : 0; fprintf(o, "%d%s", lo | hi << 4, b + 1 < PB ? "," : ""); }
         fprintf(o, "}%s\n", tc + 1 < rlh9::TOTC ? "," : "");
+    }
+    fprintf(o, "};\n");
+    // zU | S code lengths (<= 6) per set and S = 1..15; row S = 0 and entries z > S are 0
+    constexpr int RS = rlh9::REMS + 1;
+    fprintf(o, "#define RLH9_REMS %d\nstatic const uint8_t RLH9_REMLEN[%d][%d][%d] = {\n", rlh9::REMS, rlh9::NSET, RS, RS);
+    for (int t = 0; t < rlh9::NSET; ++t) {
+        fprintf(o, "{");
+        for (int S = 0; S < RS; ++S) {
+            uint8_t RL[RS] = {0};
+            if (S) rlh9::huff_len(&C.rem[(size_t(t) * RS + S) * RS], S + 1, rlh9::REMB, RL);
+            fprintf(o, "{"); for (int z = 0; z < RS; ++z) fprintf(o, "%d%s", RL[z], z + 1 < RS ? "," : ""); fprintf(o, "}%s", S + 1 < RS ? "," : "");
+        }
+        fprintf(o, "}%s\n", t + 1 < rlh9::NSET ? "," : "");
     }
     fprintf(o, "};\n"); fclose(o);
     printf("trained on %d images, %.1f Mpx, %d excluded, bands photo/screen %llu/%llu -> %s\n", n, px / 1e6, skipped, (unsigned long long)nb[0], (unsigned long long)nb[1], argv[1]);

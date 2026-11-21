@@ -30,7 +30,7 @@
 //       hole of the same coder even if other coders wrote after it; the size of 1/2, no pages (rev '4');
 //   5 - rlgr_bytes.hpp: every stream owns byte chunks of variable size cut from one shared byte head at the llrice
 //       reservation points; no pages, no holes, the bit position only inside the stream (rev '5').
-//   9 - rlh9.hpp: RLH8 superscalar codec R8F3 (16-row bands, 4 lanes Y/Y/S/S decoded token-interleaved, implicit
+//   9 - rlh9.hpp: RLH8 superscalar codec R8F4 (16-row bands, 4 lanes Y/Y/S/S decoded token-interleaved, implicit
 //       micro-FSM context, static Huffman, photo/screen table set per band, SIMD wave MED); 8-bit RGB only (rev '9').
 // LLRICE_FAST=0 is the old spelling of LLRICE_ENGINE=0. USE_SIMPLE_RLGR, USE_MODEL_K and USE_NEW_LINE need 0.
 #ifndef LLRICE_ENGINE
@@ -105,7 +105,7 @@ namespace llrice
     inline std::string build_tag() {
         std::string t = "llrice ENGINE=" + std::to_string(LLRICE_ENGINE) + " CODER=" + std::to_string(CODER);
 #if LLRICE_ENGINE == 9
-        t += " FMT=R8F3"; t += RLH9_RCT ? " RCT=fnbli" : " RCT=rct";
+        t += " FMT=R8F4"; t += RLH9_RCT ? " RCT=fnbli" : " RCT=rct";
 #else
         t += LLRICE_RCT_FNBLI ? " RCT=fnbli" : " RCT=rct";
 #endif
