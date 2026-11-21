@@ -99,6 +99,28 @@ namespace llrice
     constexpr inline uint8_t rev = LLRICE_ENGINE >= 2 ? uint8_t('0' + LLRICE_ENGINE) : uint8_t('1');   // new formats: other signatures
     constexpr inline uint32_t signature = 'l' | 'l' << 8U | 'r' << 16U | rev << 24U;
 
+    // The first line of a .llr file: the program name and the build parameters that change the format, e.g.
+    // "llrice ENGINE=1 CODER=3 RCT=fnbli PRESET=screens\n". A decoder only accepts a file of its own build: the format is
+    // bound to the build while it is not stable.
+    inline std::string build_tag() {
+        std::string t = "llrice ENGINE=" + std::to_string(LLRICE_ENGINE) + " CODER=" + std::to_string(CODER);
+#if LLRICE_ENGINE == 9
+        t += RLH9_RCT ? " RCT=fnbli" : " RCT=rct";
+#else
+        t += LLRICE_RCT_FNBLI ? " RCT=fnbli" : " RCT=rct";
+#endif
+#if LLRICE_ENGINE <= 5
+        t += LLRICE_RLGR_PRESET == 1 ? " PRESET=screens" : " PRESET=clic";
+#endif
+#if defined(RLGR_POOL3)
+        t += " POOL3";
+#endif
+#if TRUNC_SPLIT != 1
+        t += " TRUNC_SPLIT=" + std::to_string(TRUNC_SPLIT);
+#endif
+        return t;
+    }
+
     // stream classes per page store: PagePool -> original llrice classes, rlgrf::PageBuf / FastIn -> rlgr_fast
     template <typename Pool> struct Coders;
     template <> struct Coders<PagePool> {

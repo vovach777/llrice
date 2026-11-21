@@ -26,7 +26,17 @@ inline uint64_t g_head = 0, g_nshrink = 0, g_lost_b = 0;
 #else
 #define RLGR_ST(x)
 #endif
-constexpr uint32_t MAX_K = 240, UP_K = 5, DOWN_K = 9, UP_K_DIRECT_RL = 2, DOWN_K_DIRECT_RL = 3, DOWN_K_RICE = 2;   // llrice
+// RLGR adaptation constants. LLRICE_RLGR_PRESET 0: tuned on CLIC photos (original Malvar 4, 6, 3, 3).
+// 1: screens, coordinate descent on 12 screens (6 gb82sc + 6 qoiweb), -10.6%; tuned on one half, the other half
+// gains -10.2% / -11.5%: runs on screens are long, so the run parameter has to grow fast (UP_K_DIRECT_RL 8).
+#ifndef LLRICE_RLGR_PRESET
+#define LLRICE_RLGR_PRESET 0
+#endif
+#if LLRICE_RLGR_PRESET == 1
+constexpr uint32_t MAX_K = 240, UP_K = 4, DOWN_K = 10, UP_K_DIRECT_RL = 8, DOWN_K_DIRECT_RL = 5, DOWN_K_RICE = 2;   // screens
+#else
+constexpr uint32_t MAX_K = 240, UP_K = 5, DOWN_K = 9, UP_K_DIRECT_RL = 2, DOWN_K_DIRECT_RL = 3, DOWN_K_RICE = 2;   // llrice, CLIC
+#endif
 
 struct PageBuf {                                    // encoder: grows on demand; decoder: the pages of the file
     std::vector<uint64_t> w; size_t top = 0;

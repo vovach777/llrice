@@ -12,10 +12,20 @@
 #include "rice.hpp"
 namespace RLGR {
     constexpr uint32_t MAX_K = 240;
+#ifndef LLRICE_RLGR_PRESET
+#define LLRICE_RLGR_PRESET 0   // 0: tuned on CLIC photos; 1: screens (see rlgr_fast.hpp)
+#endif
+#if LLRICE_RLGR_PRESET == 1
+    constexpr uint32_t UP_K = 4;
+    constexpr uint32_t DOWN_K = 10;
+    constexpr uint32_t UP_K_DIRECT_RL = 8;
+    constexpr uint32_t DOWN_K_DIRECT_RL = 5;
+#else
     constexpr uint32_t UP_K = 5;   //original: 4
     constexpr uint32_t DOWN_K = 9; //original: 6
     constexpr uint32_t UP_K_DIRECT_RL = 2; //original: 3
     constexpr uint32_t DOWN_K_DIRECT_RL = 3;
+#endif
     //constexpr uint32_t UP_K_RICE = 2;
     constexpr uint32_t DOWN_K_RICE = 2;
     // vk == 0: kr -= min(kr, DOWN_K_RICE); vk == 1: kept; else kr = min(kr + vk, MAX_K); without data-dependent branches

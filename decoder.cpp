@@ -24,10 +24,18 @@ int main(int argc, char** argv) {
         std::cerr << "Error opening input file: " << filename << std::endl;
         return 1;
     }
-    size_t size = inFile.seekg(0, std::ios::end).tellg() / sizeof(uint64_t);
-    inFile.seekg(0, std::ios::beg);
+    std::string line;
+    if (!std::getline(inFile, line) || line.size() > 256) { std::cerr << "Not an llrice file: " << filename << std::endl; return 1; }
+    const std::string tag = llrice::build_tag();
+    if (line != tag) {
+        std::cerr << "The file was made by \"" << line << "\", this decoder is \"" << tag << "\"" << std::endl;
+        return 1;
+    }
+    const std::streamoff body = inFile.tellg();
+    const size_t size = size_t(inFile.seekg(0, std::ios::end).tellg() - body) / sizeof(uint64_t);
+    inFile.seekg(body, std::ios::beg);
     std::vector<uint64_t> compressed(size);
-    inFile.read(reinterpret_cast<char*>(compressed.data()), size * sizeof(uint64_t));
+    inFile.read(reinterpret_cast<char*>(compressed.data()), std::streamsize(size * sizeof(uint64_t)));
     inFile.close();
     try {
         execute_time.startnew();
