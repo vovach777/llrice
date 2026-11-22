@@ -27,7 +27,8 @@ Tables: `rlh9_tables.h` from `tools/rlh9/rlh9_train.cpp` (1157 images, 1648 Mpx,
 - photo set (`-f 0`): CLIC 2020 professional train, 536 of 585 photos (the 49 held out: sorted clic-palic2
   color/*.pln, index % 12 == 3);
 - screen set (`-f 1`): gb82 screenshots codec_wiki, gmessages, graph, gui (weight 4) + QOI suite screenshot_game
-  (617 PNG). Not trained on: the 12 classic screens (halic-wins-screen-p6) and web8 (8 tall QOI web pages).
+  (617 PNG). Not trained on: the 12 classic screens (halic-wins-screen-p6) and web8 (8 tall QOI web pages; note: in the lab split
+  of Google Drive: datasets/ these 8 pages are training data, web8 as a test set is Claude's own pick).
 `SKIP=test49.txt PNG2PPM="python3 png2ppm.py" ./rlh9_train rlh9_tables.h -f 0 <clic ppm dir> -f 1 -w 4 <gb4 dir> -w 1 <qoi game dir>`
 
 Measured (Claude's sandbox, Xeon ~3.8 GHz, 1 thread, -r 3):
@@ -47,6 +48,13 @@ remove this correlation, max(zU, zV) and |eU| + |eV| + signs lose to the sum.
 Checks: round trip of all three sets; 96 edge cases under ASan/UBSan with SIMD and with -DRLH9_NO_SIMD; 168 long-run
 cases (runs up to 16382, widths 8200..16383); corrupt-stream fuzz 2 x 5000 mutations under ASan/UBSan; R8F2 and R8F3
 files reject each other by the build tag. E0..E8 are not touched.
+Encoder (2026-11-22, Argon's fast encoder, same output byte for byte): vector front end (AVX2 / SSSE3 / scalar,
+cur[x-1] by register shift), nonzero bitmask + tzcnt in bands with >= 30% zeros, one branch-free 64-bit put per token,
+tbin_tbl[2048] for the truncated code; ablation macros RLH9_ENC_MODE, RLH9_VENC_MODE, RLH9_RENC_MODE, RLH9_TBIN_MODE,
+RLH9_FSM_ALU. Checked by Claude with separate binaries (old encoder from 01a4303 vs new AVX2 / SSE4.2 / -DRLH9_NO_SIMD,
+cmp of the output files): 175 files (90 edge images 1x1..16383x17, valid41, 12 screens, web8, Kodak) x 3 builds, 0 diffs;
+ASan/UBSan clean; the trainer gives identical tables. Encode MB/s, 1 thread: valid41 158 -> 299, 12 screens 421 -> 1700,
+web8 369 -> 1195 (SSE build 279 / 1470 / 1048). Decoder unchanged.
 Bug fixed by R8F3: the R8F1/R8F2 encoder put code + mantissa (up to 35 bits) into a 64-bit accumulator that could hold
 31 pending bits, so a zero run >= 8192 with a long code (images wider than 8192) produced a corrupt stream.
 

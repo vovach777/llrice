@@ -1,26 +1,8 @@
 // rlh9.hpp - LLRICE_ENGINE 9: RLH8 superscalar codec, format R8F4 (signature rev '9').
 // Design: Argon (rlh8f.cpp, split micro-FSM, dual tables, R8F3 geometry, 2026-11-21/22) on top of Claude's RLH8s prototype.
-//
-// Front end: RCT (U = r-g, V = b-g, Y = g + ((U+V)>>2); RLH9_RCT 1: fNBLI), MED per plane (row 0: left,
-//          column 0: top), zigzag. Chroma is coded as one plane S = zU + zV (0..2040) plus zU in 0..S as a truncated
-//          code right after every non-zero S token (zV = S - zU).
-// Geometry: 16-row bands; each band row of a plane is one chunk of width W; EOB = "rest of this row is zero".
-// Lanes: 4 independent byte streams per band: Y rows 0..m-1, Y rows m..nb-1, S rows 0..m-1, S rows m..nb-1, m = nb / 2;
-//          band header = 4 x u32 lane byte sizes; bit 31 of the first = screen table set.
-// Alphabet (E8): 19 run classes (0..7 exact, 8..18 octave + mantissa) x 44 quarter-octave value classes + EOB = 837.
-// Context: implicit, per lane, a split micro-automaton: sv (48 states, driven by the half-octave value class, calibrated
-//          on llrice adapt_kr) and sr (16 states, an EMA 1/4 of the run bit width); ctx 0..47 per table set:
-//          photos (sv >> 1) * 2 + (sr >> 3), screens (sv >> 2) * 4 + (sr >> 2).
-//          The next state depends on the Huffman symbol only, so the decoder takes it from a byte table next to the LUT,
-//          in parallel with the mantissa work. State (sv 12, sr 0) at the start of every lane of every band.
-// Tables: 2 sets (photo, screen) x 2 groups (Y, S) x 48 = 192 static canonical Huffman tables (<= 15 bits); per set
-//          and S = 1..15 a static code (<= 6 bits) for zU | S (RemLUT, Argon); S >= 16: truncated binary.
-//          The encoder picks screen tables when >= RLH9_ZTHR % of the band's Y, U, V residuals are zero (encoder-only knob).
-// Decoder: per band an entropy pass with the 4 lanes interleaved ONE TOKEN per lane per round (packed 32-bit LUT,
-//          one LUT load + one class-byte load per token, the zU split read branch-free from the same 64-bit window),
-//          then per 8 rows a SIMD wave MED (row k at column x - k, 8 rows = 8 int16 lanes of an SSE2 register)
-//          and a vector inverse RCT. Scalar fallback without SSE2.
-// Limits: 8-bit RGB only, width <= 16383 (run classes end at 16383).
+// Fast encoder (V3 + ablations, 2026-11-22): fused SIMD front (AVX2 / SSE2+SSSE3 / scalar), bitmask zero-skip (tzcnt),
+// branchless 64-bit BitW_Fast (single put per token), optional 2-lane superscalar & branchless zU|S.
+// Byte-identical output to 01a4303 scalar rlh9::encode across AVX2, SSE2/SSSE3, and RLH9_NO_SIMD builds.
 #pragma once
 #include <cstdint>
 #include <cstring>
@@ -36,11 +18,45 @@
 #include "rlh9_tables.h"
 #endif
 
+// Encoder ablation knobs (default: V3_BEST; format and output bytes are 100% invariant)
+// RLH9_ENC_MODE:
+//   0 = original 01a4303 scalar encoder (reference)
+//   1 = V3 (fused SIMD front + bitmask tzcnt + branchless BitW_Fast single-put + branchless tbin)
+//   2 = V3 + Idea 1a (2-lane interleaved: Y0+Y1, then S0+S1)
+//   3 = V3 + Idea 1b (2-lane interleaved: Y0+S0, then Y1+S1)
+//   4 = V3 + Idea 2a (bitmask tzcnt only in screen bands sc==1; simple scan in photo bands sc==0)
+//   5 = V3 + Idea 2b (bitmask tzcnt when band zero-ratio >= RLH9_MASK_THR%, else simple scan)
+//   6 = V3 + Idea 3  (branchless cmov for zU|S: rem_cw vs tbin_tbl[2048], no S<=15 branch)
+//   7 = V3 + Idea 2a + Idea 1b (combined test)
+//   8 = V3 + Idea 2a + Idea 3  (combined test)
+#ifndef RLH9_ENC_MODE
+#define RLH9_ENC_MODE 5
+#endif
+#ifndef RLH9_MASK_THR
+#define RLH9_MASK_THR 30
+#endif
+// LUT vs ALU knobs (apply to modes >= 1):
+// RLH9_VENC_MODE: 0 = original struct VEnc[2048], 1 = packed uint32_t venc32[2048], 2 = pure ALU (clz + shifts)
+#ifndef RLH9_VENC_MODE
+#define RLH9_VENC_MODE 0
+#endif
+// RLH9_RENC_MODE: 0 = original struct REnc[256], 1 = packed uint32_t renc32[256], 2 = pure ALU (clz + shifts)
+#ifndef RLH9_RENC_MODE
+#define RLH9_RENC_MODE 0
+#endif
+// RLH9_TBIN_MODE: 0 = ALU clz (with S<=15 branch), 1 = tbin_tbl[2048] LUT (with S<=15 branch), 2 = tbin_tbl[2048] branchless cmov
+#ifndef RLH9_TBIN_MODE
+#define RLH9_TBIN_MODE 1
+#endif
+// RLH9_FSM_ALU: 0 = Fsm::v[48][16] LUT, 1 = ALU adapt_kr for sv (sr always 128B LUT due to double-rounding format rule)
+#ifndef RLH9_FSM_ALU
+#define RLH9_FSM_ALU 0
+#endif
+
 namespace rlh9
 {
     inline int bw(uint32_t x) { return x ? 32 - __builtin_clz(x) : 0; }
     inline int cv_of(uint32_t v) { const int b = bw(v); if (b <= 1) return b; if (b == 2) return 4 + int(v & 1); return 4 * b - 4 + int((v >> (b - 3)) & 3); }
-    // value classes 2, 3, 6, 7 never occur (cv_of skips them); they get harmless values so that corrupt streams stay defined
     inline int vm_of_cv(int cv) { return cv <= 7 ? 0 : (cv + 4) / 4 - 3; }
     inline uint32_t vbase_of_cv(int cv) { if (cv <= 1) return uint32_t(cv); if (cv == 4 || cv == 5) return uint32_t(cv - 2); if (cv < 8) return 1; int b = (cv + 4) / 4, q = (cv + 4) % 4; return (1u << (b - 1)) | (uint32_t(q) << (b - 3)); }
     inline int rs_of(uint32_t rl) { return rl < 8 ? int(rl) : 8 + bw(rl) - 4; }
@@ -50,29 +66,25 @@ namespace rlh9
     constexpr int NV = 44, NR = 19, NSYM = NR * NV + 1, EOB = NSYM - 1, MAXL = 15;
     constexpr int NCTX = 48, NGRP = 2, NSET = 2, SETC = NGRP * NCTX, TOTC = NSET * SETC;
 #ifndef RLH9_ZTHR
-#define RLH9_ZTHR 65   // percent of zero residuals in a band that selects the screen tables (encoder only)
+#define RLH9_ZTHR 65
 #endif
     constexpr uint32_t MAX_W = 16383;
 #ifndef RLH9_RCT
-#define RLH9_RCT 0     // 0 (R8F3): U = R-G, V = B-G, Y = G + ((U+V)>>2); 1: fNBLI colour (V -= U>>2), needs other tables; with S = zU + zV
-                       // the old RCT is better (photos -0.06%, 12 screens -0.4%, web8 -0.25%)
+#define RLH9_RCT 0
 #endif
 #ifndef RLH9_LUTB
 #define RLH9_LUTB 9
 #endif
-    constexpr int LUTB = RLH9_LUTB;      // decoder-only knob, the format does not depend on it
+    constexpr int LUTB = RLH9_LUTB;
 #ifndef RLH9_NO_TABLES
     static_assert(RLH9_NSYM == NSYM && RLH9_TOTC == TOTC && RLH9_REMS == 15, "rlh9_tables.h does not match rlh9.hpp");
 #endif
 
     constexpr int HB = 16, NLANE = 4;
-    constexpr int REMS = 15, REMB = 6;   // zU | S for S <= REMS: static Huffman per set and S, codes <= REMB bits (RemLUT, Argon)
-    // half-octave value class 0..15 (a function of the quarter-octave class only), run class min(bw(run), 7)
+    constexpr int REMS = 15, REMB = 6;
     inline int hoct_v(uint32_t v) { if (v <= 1) return 0; const int b = bw(v); if (b >= 9) return 15; return 2 * b - 3 + int((v >> (b - 2)) & 1u); }
     inline int rcls(uint32_t rl) { const int b = bw(rl); return b > 7 ? 7 : b; }
-    // lane state st = sv | sr << 6
     constexpr uint32_t ST0 = 12;
-// ctx (0..47) per table set: photos (sv >> 1) * 2 + (sr >> 3), screens (sv >> 2) * 4 + (sr >> 2) = (st & m) + ((st >> 6) >> c)
     inline uint32_t ctx_m(uint32_t set) { return set ? 60u : 62u; }
     inline uint32_t ctx_c(uint32_t set) { return set ? 2u : 3u; }
     inline uint32_t ctx_of(uint32_t st, uint32_t m, uint32_t c) { return (st & m) + ((st >> 6) >> c); }
@@ -80,20 +92,34 @@ namespace rlh9
         uint8_t v[48][16], r[16][8];
         Fsm() {
             static const uint32_t rep_v[16] = {1, 2, 3, 4, 6, 9, 13, 19, 27, 39, 55, 79, 111, 159, 223, 384};
-            for (int s = 0; s < 48; ++s) for (int b = 0; b < 16; ++b) {      // sv = kr * 2/3 of llrice adapt_kr
+            for (int s = 0; s < 48; ++s) for (int b = 0; b < 16; ++b) {
                 uint32_t kr = uint32_t((s * 3 + 1) / 2); const uint32_t x = (rep_v[b] - 1) >> (kr >> 3);
                 const uint32_t add = x >= 2 ? x : 0u, sub = x == 0 ? std::min(kr, 2u) : 0u;
                 kr = std::min(kr + add, 240u) - sub; v[s][b] = uint8_t(std::min(int((kr * 2 + 1) / 3), 47));
             }
-            // sr / 2.5 = EMA 1/4 of the run class: round((s/2.5 * 0.75 + b * 0.25) * 2.5), forced one step when the class
-            // is 0.4 away; listed literally because the double rounding of the reference (r[14][0] = 10) is part of the format
             static const uint8_t R[16][8] = {{0,1,1,2,3,3,4,4},{1,2,2,3,3,4,5,5},{1,2,3,3,4,5,5,6},{2,3,4,4,5,5,6,7},{3,3,4,5,6,6,7,7},{4,4,5,6,6,7,8,8},{5,5,6,7,7,8,8,9},{5,6,6,7,8,8,9,10},
                                              {6,7,7,8,9,9,10,10},{7,7,8,8,9,10,11,11},{8,8,9,9,10,11,11,12},{8,9,10,10,11,12,12,13},{9,10,10,11,11,12,13,13},{10,10,11,12,12,13,14,14},{10,11,12,12,13,13,14,15},{11,12,13,13,14,14,15,15}};
             std::memcpy(r, R, sizeof r);
         }
     };
     inline const Fsm& fsm() { static const Fsm f; return f; }
-    inline uint32_t next_st(const Fsm& F, uint32_t st, int vh, int rc) { return uint32_t(F.v[st & 63u][vh]) | (uint32_t(F.r[st >> 6][rc]) << 6); }
+    inline uint32_t next_st_alu_v(uint32_t sv, int vh) {
+        static const uint32_t rep_v[16] = {1, 2, 3, 4, 6, 9, 13, 19, 27, 39, 55, 79, 111, 159, 223, 384};
+        uint32_t kr = (sv * 3u + 1u) >> 1;
+        const uint32_t x = (rep_v[vh] - 1u) >> (kr >> 3);
+        const uint32_t add = x >= 2u ? x : 0u;
+        const uint32_t sub = x == 0u ? (kr < 2u ? kr : 2u) : 0u;
+        kr = (kr + add > 240u ? 240u : kr + add) - sub;
+        const uint32_t nv = (kr * 2u + 1u) / 3u;
+        return nv > 47u ? 47u : nv;
+    }
+    inline uint32_t next_st(const Fsm& F, uint32_t st, int vh, int rc) {
+#if RLH9_FSM_ALU == 1
+        return next_st_alu_v(st & 63u, vh) | (uint32_t(F.r[st >> 6][rc]) << 6);
+#else
+        return uint32_t(F.v[st & 63u][vh]) | (uint32_t(F.r[st >> 6][rc]) << 6);
+#endif
+    }
     inline int med(int a, int b, int c) { const int mx = a > b ? a : b, mn = a > b ? b : a; return std::max(mn, std::min(mx, a + b - c)); }
     inline uint16_t zz(int e) { return uint16_t((uint32_t(e) << 1) ^ uint32_t(e >> 31)); }
     inline int uz(uint32_t u) { return int(u >> 1) ^ -int(u & 1); }
@@ -102,23 +128,30 @@ namespace rlh9
     struct Tables {
         uint8_t len[TOTC][NSYM];
         uint32_t enc_cw[TOTC][NSYM];                     // code | len << 16
-        uint32_t lut[TOTC][1 << LUTB];                   // len:4 nm:5 vm:3 vbase:11 rbase:6 ... eob:bit31; 0 = slow path
-        uint8_t lut_cls[TOTC][1 << LUTB];                // rc << 4 | vh of the same entry: drives the state automaton
+        uint32_t lut[TOTC][1 << LUTB];
+        uint8_t lut_cls[TOTC][1 << LUTB];
         uint16_t first[TOTC][MAXL + 2], cntl[TOTC][MAXL + 2], offs[TOTC][MAXL + 2], sorted[TOTC][NSYM];
         SlowSym si[NSYM];
         uint8_t rem_len[NSET][REMS + 1][REMS + 1];
         uint16_t rem_cw[NSET][REMS + 1][REMS + 1];        // code | len << 8
-        uint16_t rem_lut[NSET][REMS + 1][1 << REMB];      // zU | len << 8 (row S = 0 unused)
+        uint16_t rem_lut[NSET][REMS + 1][1 << REMB];
         struct VEnc { uint8_t cv, vm, vh; uint16_t vman; } venc[2048];
         struct REnc { uint8_t rs, rm, rc; uint16_t rman; } renc[256];
+        // Compact 32-bit packed encoder tables (1 load per lookup)
+        // venc32[v]: cv:6 | vm:4 << 6 | vh:4 << 10 | vman:11 << 14
+        // renc32[r]: rs:5 | rm:4 << 5 | rc:3 << 9  | rman:14 << 12
+        // tbin_tbl[sv]: k:4 | t:12 << 4  (for sv = 1..2047, m = sv + 1)
+        uint32_t venc32[2048];
+        uint32_t renc32[256];
+        uint16_t tbin_tbl[2048];
 
-        // rl: NSET x (REMS+1) x (REMS+1) code lengths of zU in 0..S (rows S = 1..REMS), each row a complete prefix code
         void build_rem(const uint8_t* rl) {
             std::memset(rem_cw, 0, sizeof rem_cw); std::memset(rem_lut, 0, sizeof rem_lut);
             for (int t = 0; t < NSET; ++t) for (int S = 1; S <= REMS; ++S) {
                 uint32_t c = 0, kraft = 0;
                 for (int z = 0; z <= S; ++z) { rem_len[t][S][z] = rl[(t * (REMS + 1) + S) * (REMS + 1) + z]; const int l = rem_len[t][S][z];
-                    if (l < 1 || l > REMB) throw std::runtime_error("rlh9: bad rem table"); kraft += 1u << (REMB - l); }
+                    if (l < 1 || l > REMB) throw std::runtime_error("rlh9: bad rem table");
+                    kraft += 1u << (REMB - l); }
                 if (kraft != 1u << REMB) throw std::runtime_error("rlh9: incomplete rem table");
                 for (int l = 1; l <= REMB; ++l) {
                     for (int z = 0; z <= S; ++z) if (rem_len[t][S][z] == l) {
@@ -130,7 +163,7 @@ namespace rlh9
                 }
             }
         }
-        void build(const uint8_t* packed_len) {          // packed_len: TOTC x ceil(NSYM/2) nibbles, low nibble first
+        void build(const uint8_t* packed_len) {
             constexpr int PB = (NSYM + 1) / 2;
             for (int tc = 0; tc < TOTC; ++tc) for (int s = 0; s < NSYM; ++s) { const uint8_t b = packed_len[tc * PB + s / 2]; len[tc][s] = uint8_t(s & 1 ? b >> 4 : b & 15); }
             for (int s = 0; s < NSYM; ++s) {
@@ -163,8 +196,27 @@ namespace rlh9
             enc_luts();
         }
         void enc_luts() {
-            for (int v = 1; v < 2048; ++v) { const int cv = cv_of(uint32_t(v)); venc[v] = {uint8_t(cv), uint8_t(vm_of_cv(cv)), uint8_t(hoct_v(vbase_of_cv(cv))), uint16_t(uint32_t(v) - vbase_of_cv(cv))}; }
-            for (int r = 0; r < 256; ++r) { const int rs = rs_of(uint32_t(r)); renc[r] = {uint8_t(rs), uint8_t(rm_of_rs(rs)), uint8_t(rcls(rbase_of_rs(rs))), uint16_t(uint32_t(r) - rbase_of_rs(rs))}; }
+            venc32[0] = 0; tbin_tbl[0] = 0;
+            for (int v = 1; v < 2048; ++v) {
+                const int cv = cv_of(uint32_t(v));
+                const int vm = vm_of_cv(cv);
+                const int vh = hoct_v(vbase_of_cv(cv));
+                const uint32_t vman = uint32_t(v) - vbase_of_cv(cv);
+                venc[v] = {uint8_t(cv), uint8_t(vm), uint8_t(vh), uint16_t(vman)};
+                venc32[v] = uint32_t(cv) | (uint32_t(vm) << 6) | (uint32_t(vh) << 10) | (vman << 14);
+                const uint32_t m = uint32_t(v) + 1u;
+                const uint32_t k = 31u - uint32_t(__builtin_clz(m));
+                const uint32_t t = (2u << k) - m;
+                tbin_tbl[v] = uint16_t(k | (t << 4));
+            }
+            for (int r = 0; r < 256; ++r) {
+                const int rs = rs_of(uint32_t(r));
+                const int rm = rm_of_rs(rs);
+                const int rc = rcls(rbase_of_rs(rs));
+                const uint32_t rman = uint32_t(r) - rbase_of_rs(rs);
+                renc[r] = {uint8_t(rs), uint8_t(rm), uint8_t(rc), uint16_t(rman)};
+                renc32[r] = uint32_t(rs) | (uint32_t(rm) << 5) | (uint32_t(rc) << 9) | (rman << 12);
+            }
         }
     };
 #ifndef RLH9_NO_TABLES
@@ -174,11 +226,32 @@ namespace rlh9
 #endif
 
     // ---------------- front end: one band of residuals (zigzag), planes Y, U, V and S = zU + zV ----------------
+#if defined(RLH9_SSE) && defined(__SSSE3__)
+    inline void rgb24_deint16_ssse3(const uint8_t* p, __m128i& r8, __m128i& g8, __m128i& b8) {
+        const __m128i c0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+        const __m128i c1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 16));
+        const __m128i c2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 32));
+        const __m128i mR0 = _mm_setr_epi8(0,3,6,9,12,15,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
+        const __m128i mR1 = _mm_setr_epi8(-1,-1,-1,-1,-1,-1,2,5,8,11,14,-1,-1,-1,-1,-1);
+        const __m128i mR2 = _mm_setr_epi8(-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,1,4,7,10,13);
+        const __m128i mG0 = _mm_setr_epi8(1,4,7,10,13,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
+        const __m128i mG1 = _mm_setr_epi8(-1,-1,-1,-1,-1,0,3,6,9,12,15,-1,-1,-1,-1,-1);
+        const __m128i mG2 = _mm_setr_epi8(-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,2,5,8,11,14);
+        const __m128i mB0 = _mm_setr_epi8(2,5,8,11,14,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
+        const __m128i mB1 = _mm_setr_epi8(-1,-1,-1,-1,-1,1,4,7,10,13,-1,-1,-1,-1,-1,-1);
+        const __m128i mB2 = _mm_setr_epi8(-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,0,3,6,9,12,15);
+        r8 = _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(c0, mR0), _mm_shuffle_epi8(c1, mR1)), _mm_shuffle_epi8(c2, mR2));
+        g8 = _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(c0, mG0), _mm_shuffle_epi8(c1, mG1)), _mm_shuffle_epi8(c2, mG2));
+        b8 = _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(c0, mB0), _mm_shuffle_epi8(c1, mB1)), _mm_shuffle_epi8(c2, mB2));
+    }
+#endif
+
     struct Front {
         int W; std::vector<int16_t> prev[3], cur[3];
         explicit Front(int w) : W(w) { for (int p = 0; p < 3; ++p) { prev[p].assign(size_t(w), 0); cur[p].assign(size_t(w), 0); } }
-        // rgb: row-major 8-bit RGB, rows y0..y0+nb-1 -> u[p * nb * W + r * W + x], p = 0 Y, 1 U, 2 V, 3 S; returns the zero count of Y, U, V
-        size_t band(const uint8_t* rgb, int y0, int nb, uint16_t* u) {
+
+        // Scalar reference band (also used by RLH9_ENC_MODE == 0 and RLH9_NO_SIMD)
+        size_t band_scalar(const uint8_t* rgb, int y0, int nb, uint16_t* u) {
             const size_t PS = size_t(nb) * W; size_t z = 0;
             for (int r = 0; r < nb; ++r) {
                 const int y = y0 + r; const uint8_t* s = rgb + size_t(y) * W * 3;
@@ -207,10 +280,224 @@ namespace rlh9
             }
             return z;
         }
+
+        // Fused SIMD front (writes U0=zY, U1=zU, US=zU+zV; skips unused U2 plane for 25% less store bandwidth)
+        // Zero store-to-load forwarding stalls via register-shift alignr for left neighbor a = cur[x-1].
+        size_t band_yus(const uint8_t* rgb, int y0, int nb, uint16_t* U0b, uint16_t* U1b, uint16_t* USb) {
+            size_t z = 0;
+#if defined(RLH9_SSE) && defined(__AVX2__)
+            const __m256i vzero = _mm256_setzero_si256();
+#if RLH9_RCT == 1
+            const __m256i vk2 = _mm256_set1_epi16(2);
+#endif
+            auto med_avx = [](__m256i a, __m256i b, __m256i c) __attribute__((always_inline)) {
+                const __m256i mn = _mm256_min_epi16(a, b), mx = _mm256_max_epi16(a, b);
+                return _mm256_max_epi16(mn, _mm256_min_epi16(mx, _mm256_sub_epi16(_mm256_add_epi16(a, b), c)));
+            };
+            auto zig_avx = [](__m256i e) __attribute__((always_inline)) {
+                return _mm256_xor_si256(_mm256_slli_epi16(e, 1), _mm256_srai_epi16(e, 15));
+            };
+            auto shift_left1_avx = [](__m256i prev_v, __m256i cur_v) __attribute__((always_inline)) {
+                const __m256i hl = _mm256_permute2x128_si256(prev_v, cur_v, 0x21);
+                return _mm256_alignr_epi8(cur_v, hl, 14);
+            };
+#elif defined(RLH9_SSE)
+            const __m128i vzero = _mm_setzero_si128();
+#if RLH9_RCT == 1
+            const __m128i vk2 = _mm_set1_epi16(2);
+#endif
+            auto med_sse = [](__m128i a, __m128i b, __m128i c) __attribute__((always_inline)) {
+                const __m128i mn = _mm_min_epi16(a, b), mx = _mm_max_epi16(a, b);
+                return _mm_max_epi16(mn, _mm_min_epi16(mx, _mm_sub_epi16(_mm_add_epi16(a, b), c)));
+            };
+            auto zig_sse = [](__m128i e) __attribute__((always_inline)) {
+                return _mm_xor_si128(_mm_slli_epi16(e, 1), _mm_srai_epi16(e, 15));
+            };
+            auto shift_left1_sse = [](__m128i prev_v, __m128i cur_v) __attribute__((always_inline)) {
+#if defined(__SSSE3__)
+                return _mm_alignr_epi8(cur_v, prev_v, 14);
+#else
+                return _mm_or_si128(_mm_slli_si128(cur_v, 2), _mm_srli_si128(prev_v, 14));
+#endif
+            };
+#endif
+            for (int r = 0; r < nb; ++r) {
+                const int y = y0 + r; const uint8_t* s = rgb + size_t(y) * W * 3;
+                int16_t *C0 = cur[0].data(), *C1 = cur[1].data(), *C2 = cur[2].data();
+                const int16_t *Q0 = prev[0].data(), *Q1 = prev[1].data(), *Q2 = prev[2].data();
+                uint16_t *U0 = U0b + size_t(r) * W, *U1 = U1b + size_t(r) * W, *US = USb + size_t(r) * W;
+                // Prologue x = 0
+                {
+                    const int R = s[0], G = s[1], B = s[2], U = R - G;
+#if RLH9_RCT == 1
+                    const int Y = G + ((U + (B - G) + 2) >> 2), V = (B - G) - (U >> 2);
+#else
+                    const int V = B - G, Y = G + ((U + V) >> 2);
+#endif
+                    C0[0] = int16_t(Y); C1[0] = int16_t(U); C2[0] = int16_t(V);
+                    const uint16_t z0 = zz(y == 0 ? Y : Y - Q0[0]);
+                    const uint16_t z1 = zz(y == 0 ? U : U - Q1[0]);
+                    const uint16_t z2 = zz(y == 0 ? V : V - Q2[0]);
+                    U0[0] = z0; U1[0] = z1; US[0] = uint16_t(z1 + z2);
+                    z += size_t(z0 == 0) + size_t(z1 == 0) + size_t(z2 == 0);
+                }
+                int x = 1;
+#if defined(RLH9_SSE) && defined(__AVX2__)
+                if (y > 0) {
+                    __m256i zacc = vzero; int zblk = 0;
+                    __m256i prev_y = _mm256_set1_epi16(C0[0]);
+                    __m256i prev_u = _mm256_set1_epi16(C1[0]);
+                    __m256i prev_v = _mm256_set1_epi16(C2[0]);
+                    for (; x + 16 <= W; x += 16) {
+                        __m128i r8, g8, b8;
+                        rgb24_deint16_ssse3(s + 3 * x, r8, g8, b8);
+                        const __m256i rv = _mm256_cvtepu8_epi16(r8), gv = _mm256_cvtepu8_epi16(g8), bv = _mm256_cvtepu8_epi16(b8);
+                        const __m256i uv = _mm256_sub_epi16(rv, gv);
+                        const __m256i bg = _mm256_sub_epi16(bv, gv);
+#if RLH9_RCT == 1
+                        const __m256i yv = _mm256_add_epi16(gv, _mm256_srai_epi16(_mm256_add_epi16(_mm256_add_epi16(uv, bg), vk2), 2));
+                        const __m256i vv = _mm256_sub_epi16(bg, _mm256_srai_epi16(uv, 2));
+#else
+                        const __m256i vv = bg;
+                        const __m256i yv = _mm256_add_epi16(gv, _mm256_srai_epi16(_mm256_add_epi16(uv, vv), 2));
+#endif
+                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(C0 + x), yv);
+                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(C1 + x), uv);
+                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(C2 + x), vv);
+                        const __m256i a0 = shift_left1_avx(prev_y, yv); prev_y = yv;
+                        const __m256i a1 = shift_left1_avx(prev_u, uv); prev_u = uv;
+                        const __m256i a2 = shift_left1_avx(prev_v, vv); prev_v = vv;
+                        const __m256i b0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(Q0 + x));
+                        const __m256i b1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(Q1 + x));
+                        const __m256i b2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(Q2 + x));
+                        const __m256i c0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(Q0 + x - 1));
+                        const __m256i c1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(Q1 + x - 1));
+                        const __m256i c2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(Q2 + x - 1));
+                        const __m256i u0 = zig_avx(_mm256_sub_epi16(yv, med_avx(a0, b0, c0)));
+                        const __m256i u1 = zig_avx(_mm256_sub_epi16(uv, med_avx(a1, b1, c1)));
+                        const __m256i u2 = zig_avx(_mm256_sub_epi16(vv, med_avx(a2, b2, c2)));
+                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(U0 + x), u0);
+                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(U1 + x), u1);
+                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(US + x), _mm256_add_epi16(u1, u2));
+                        zacc = _mm256_sub_epi16(zacc, _mm256_cmpeq_epi16(u0, vzero));
+                        zacc = _mm256_sub_epi16(zacc, _mm256_cmpeq_epi16(u1, vzero));
+                        zacc = _mm256_sub_epi16(zacc, _mm256_cmpeq_epi16(u2, vzero));
+                        if (++zblk == 8000) {
+                            alignas(32) uint16_t za[16]; _mm256_store_si256(reinterpret_cast<__m256i*>(za), zacc);
+                            for (int i = 0; i < 16; ++i) z += za[i];
+                            zacc = vzero; zblk = 0;
+                        }
+                    }
+                    alignas(32) uint16_t za[16]; _mm256_store_si256(reinterpret_cast<__m256i*>(za), zacc);
+                    for (int i = 0; i < 16; ++i) z += za[i];
+                }
+#elif defined(RLH9_SSE)
+                if (y > 0) {
+                    __m128i zacc = vzero; int zblk = 0;
+                    __m128i prev_y = _mm_set1_epi16(C0[0]);
+                    __m128i prev_u = _mm_set1_epi16(C1[0]);
+                    __m128i prev_v = _mm_set1_epi16(C2[0]);
+                    for (; x + 16 <= W; x += 16) {
+                        __m128i r8, g8, b8;
+#if defined(__SSSE3__)
+                        rgb24_deint16_ssse3(s + 3 * x, r8, g8, b8);
+#else
+                        alignas(16) uint8_t rb[16], gb[16], bb[16];
+                        for (int i = 0; i < 16; ++i) { rb[i] = s[3*(x+i)]; gb[i] = s[3*(x+i)+1]; bb[i] = s[3*(x+i)+2]; }
+                        r8 = _mm_load_si128(reinterpret_cast<const __m128i*>(rb));
+                        g8 = _mm_load_si128(reinterpret_cast<const __m128i*>(gb));
+                        b8 = _mm_load_si128(reinterpret_cast<const __m128i*>(bb));
+#endif
+                        for (int h = 0; h < 2; ++h) {
+                            const int xh = x + h * 8;
+                            const __m128i rv = h ? _mm_unpackhi_epi8(r8, vzero) : _mm_unpacklo_epi8(r8, vzero);
+                            const __m128i gv = h ? _mm_unpackhi_epi8(g8, vzero) : _mm_unpacklo_epi8(g8, vzero);
+                            const __m128i bv = h ? _mm_unpackhi_epi8(b8, vzero) : _mm_unpacklo_epi8(b8, vzero);
+                            const __m128i uv = _mm_sub_epi16(rv, gv);
+                            const __m128i bg = _mm_sub_epi16(bv, gv);
+#if RLH9_RCT == 1
+                            const __m128i yv = _mm_add_epi16(gv, _mm_srai_epi16(_mm_add_epi16(_mm_add_epi16(uv, bg), vk2), 2));
+                            const __m128i vv = _mm_sub_epi16(bg, _mm_srai_epi16(uv, 2));
+#else
+                            const __m128i vv = bg;
+                            const __m128i yv = _mm_add_epi16(gv, _mm_srai_epi16(_mm_add_epi16(uv, vv), 2));
+#endif
+                            _mm_storeu_si128(reinterpret_cast<__m128i*>(C0 + xh), yv);
+                            _mm_storeu_si128(reinterpret_cast<__m128i*>(C1 + xh), uv);
+                            _mm_storeu_si128(reinterpret_cast<__m128i*>(C2 + xh), vv);
+                            const __m128i a0 = shift_left1_sse(prev_y, yv); prev_y = yv;
+                            const __m128i a1 = shift_left1_sse(prev_u, uv); prev_u = uv;
+                            const __m128i a2 = shift_left1_sse(prev_v, vv); prev_v = vv;
+                            const __m128i b0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Q0 + xh));
+                            const __m128i b1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Q1 + xh));
+                            const __m128i b2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Q2 + xh));
+                            const __m128i c0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Q0 + xh - 1));
+                            const __m128i c1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Q1 + xh - 1));
+                            const __m128i c2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(Q2 + xh - 1));
+                            const __m128i u0 = zig_sse(_mm_sub_epi16(yv, med_sse(a0, b0, c0)));
+                            const __m128i u1 = zig_sse(_mm_sub_epi16(uv, med_sse(a1, b1, c1)));
+                            const __m128i u2 = zig_sse(_mm_sub_epi16(vv, med_sse(a2, b2, c2)));
+                            _mm_storeu_si128(reinterpret_cast<__m128i*>(U0 + xh), u0);
+                            _mm_storeu_si128(reinterpret_cast<__m128i*>(U1 + xh), u1);
+                            _mm_storeu_si128(reinterpret_cast<__m128i*>(US + xh), _mm_add_epi16(u1, u2));
+                            zacc = _mm_sub_epi16(zacc, _mm_cmpeq_epi16(u0, vzero));
+                            zacc = _mm_sub_epi16(zacc, _mm_cmpeq_epi16(u1, vzero));
+                            zacc = _mm_sub_epi16(zacc, _mm_cmpeq_epi16(u2, vzero));
+                        }
+                        if (++zblk == 4000) {
+                            alignas(16) uint16_t za[8]; _mm_store_si128(reinterpret_cast<__m128i*>(za), zacc);
+                            for (int i = 0; i < 8; ++i) z += za[i];
+                            zacc = vzero; zblk = 0;
+                        }
+                    }
+                    alignas(16) uint16_t za[8]; _mm_store_si128(reinterpret_cast<__m128i*>(za), zacc);
+                    for (int i = 0; i < 8; ++i) z += za[i];
+                }
+#endif
+                // Scalar tail (also handles y == 0)
+                int a0 = C0[x - 1], a1 = C1[x - 1], a2 = C2[x - 1];
+                if (y == 0) {
+                    for (; x < W; ++x) {
+                        const int R = s[3 * x], G = s[3 * x + 1], B = s[3 * x + 2], U = R - G;
+#if RLH9_RCT == 1
+                        const int Y = G + ((U + (B - G) + 2) >> 2), V = (B - G) - (U >> 2);
+#else
+                        const int V = B - G, Y = G + ((U + V) >> 2);
+#endif
+                        C0[x] = int16_t(Y); C1[x] = int16_t(U); C2[x] = int16_t(V);
+                        const uint16_t z0 = zz(Y - a0), z1 = zz(U - a1), z2 = zz(V - a2);
+                        U0[x] = z0; U1[x] = z1; US[x] = uint16_t(z1 + z2);
+                        z += size_t(z0 == 0) + size_t(z1 == 0) + size_t(z2 == 0);
+                        a0 = Y; a1 = U; a2 = V;
+                    }
+                } else {
+                    for (; x < W; ++x) {
+                        const int R = s[3 * x], G = s[3 * x + 1], B = s[3 * x + 2], U = R - G;
+#if RLH9_RCT == 1
+                        const int Y = G + ((U + (B - G) + 2) >> 2), V = (B - G) - (U >> 2);
+#else
+                        const int V = B - G, Y = G + ((U + V) >> 2);
+#endif
+                        C0[x] = int16_t(Y); C1[x] = int16_t(U); C2[x] = int16_t(V);
+                        const uint16_t z0 = zz(Y - med(a0, Q0[x], Q0[x - 1]));
+                        const uint16_t z1 = zz(U - med(a1, Q1[x], Q1[x - 1]));
+                        const uint16_t z2 = zz(V - med(a2, Q2[x], Q2[x - 1]));
+                        U0[x] = z0; U1[x] = z1; US[x] = uint16_t(z1 + z2);
+                        z += size_t(z0 == 0) + size_t(z1 == 0) + size_t(z2 == 0);
+                        a0 = Y; a1 = U; a2 = V;
+                    }
+                }
+                for (int p = 0; p < 3; ++p) std::swap(prev[p], cur[p]);
+            }
+            return z;
+        }
+
+        size_t band(const uint8_t* rgb, int y0, int nb, uint16_t* u) {
+            return band_scalar(rgb, y0, nb, u);
+        }
     };
 
-    // ---------------- token walk of one lane row (encoder and training share it) ----------------
-    // f(tc, sym, mantissa, nm, x) for every token (x = -1 for EOB); st is the lane state
+    // ---------------- token walk of one lane row (training and reference encoder share it) ----------------
     template <class F> inline void walk_row(const Tables& T, const uint16_t* row, int W, uint32_t gbase, uint32_t set, uint32_t& st, F&& f) {
         const Fsm& M = fsm(); uint32_t rl = 0; const uint32_t cm = ctx_m(set), cc = ctx_c(set);
         for (int x = 0; x < W; ++x) {
@@ -226,13 +513,308 @@ namespace rlh9
         if (rl) f(gbase + ctx_of(st, cm, cc), EOB, 0, 0, -1);
     }
 
-    struct BitW {                                         // put() takes at most 32 bits at a time
+    struct BitW {                                         // original branchy BitW
         uint8_t* ptr; uint64_t acc = 0; int n = 0;
         inline void put(uint64_t v, int k) { acc = (acc << k) | v; n += k; if (n >= 32) { n -= 32; const uint32_t w = __builtin_bswap32(uint32_t(acc >> n)); std::memcpy(ptr, &w, 4); ptr += 4; } }
-        // truncated binary code of x in 0..m-1, m >= 1
         inline void put_tbin(uint32_t x, uint32_t m) { const int k = bw(m) - 1; const uint32_t t = (2u << k) - m; if (x < t) put(x, k); else put(x + t, k + 1); }
         inline uint8_t* flush() { while (n >= 8) { n -= 8; *ptr++ = uint8_t(acc >> n); } if (n > 0) { *ptr++ = uint8_t(acc << (8 - n)); n = 0; } acc = 0; return ptr; }
     };
+
+    struct BitW_Fast {                                    // branchless 64-bit writer: invariant n in 0..7, accepts k in 1..56
+        uint8_t* ptr; uint64_t acc = 0; int n = 0;
+        inline void put(uint64_t v, int k) {
+            acc = (acc << k) | v;
+            n += k;
+            const uint64_t w = __builtin_bswap64(acc << (64 - n));
+            std::memcpy(ptr, &w, 8);
+            ptr += (n >> 3);
+            n &= 7;
+        }
+        inline uint8_t* flush() {
+            if (n > 0) { *ptr++ = uint8_t(acc << (8 - n)); n = 0; }
+            acc = 0; return ptr;
+        }
+    };
+
+    // Helpers for LUT vs ALU encoding of value class, run class, and zU|S
+    inline void enc_val_info(const Tables& T, uint32_t v, uint32_t& cv, uint32_t& vm, uint32_t& vh, uint32_t& vman) {
+#if RLH9_VENC_MODE == 0
+        const auto& vi = T.venc[v]; cv = vi.cv; vm = vi.vm; vh = vi.vh; vman = vi.vman;
+#elif RLH9_VENC_MODE == 1
+        const uint32_t p = T.venc32[v];
+        cv = p & 63u; vm = (p >> 6) & 15u; vh = (p >> 10) & 15u; vman = p >> 14;
+#else
+        // Pure ALU: v >= 1
+        const uint32_t b = 32u - uint32_t(__builtin_clz(v));
+        if (b <= 1u) { cv = 1u; vm = 0u; vh = 0u; vman = 0u; }
+        else if (b == 2u) { cv = 4u + (v & 1u); vm = 0u; vh = 1u + (v & 1u); vman = 0u; }
+        else {
+            const uint32_t sh = b - 3u;
+            const uint32_t q = (v >> sh) & 3u;
+            cv = 4u * b - 4u + q;
+            vm = sh;
+            vman = v & ((1u << sh) - 1u);
+            vh = (b >= 9u) ? 15u : (2u * b - 3u + (q >> 1));
+        }
+#endif
+    }
+
+    inline void enc_run_info(const Tables& T, uint32_t rl, uint32_t& rs, uint32_t& rm, uint32_t& rc, uint32_t& rman) {
+#if RLH9_RENC_MODE == 0
+        if (__builtin_expect(rl < 256u, 1)) {
+            const auto& ri = T.renc[rl]; rs = ri.rs; rm = ri.rm; rc = ri.rc; rman = ri.rman;
+        } else {
+            const uint32_t b = 32u - uint32_t(__builtin_clz(rl));
+            rs = 4u + b; rm = b - 1u; rc = b > 7u ? 7u : b; rman = rl - (1u << rm);
+        }
+#elif RLH9_RENC_MODE == 1
+        if (__builtin_expect(rl < 256u, 1)) {
+            const uint32_t p = T.renc32[rl];
+            rs = p & 31u; rm = (p >> 5) & 15u; rc = (p >> 9) & 7u; rman = p >> 12;
+        } else {
+            const uint32_t b = 32u - uint32_t(__builtin_clz(rl));
+            rs = 4u + b; rm = b - 1u; rc = b > 7u ? 7u : b; rman = rl - (1u << rm);
+        }
+#else
+        if (__builtin_expect(rl < 8u, 1)) {
+            rs = rl; rm = 0u; rman = 0u;
+            rc = rl ? (32u - uint32_t(__builtin_clz(rl))) : 0u;
+        } else {
+            const uint32_t b = 32u - uint32_t(__builtin_clz(rl));
+            rs = 4u + b; rm = b - 1u; rc = b > 7u ? 7u : b; rman = rl - (1u << rm);
+        }
+#endif
+    }
+
+    inline void enc_zu_code(const Tables& T, uint32_t sc, uint32_t sv, uint32_t zu, uint32_t& rcode, uint32_t& rlen) {
+#if RLH9_ENC_MODE == 6 || RLH9_ENC_MODE == 8 || RLH9_TBIN_MODE == 2
+        // Fully branchless cmov: RemLUT for sv <= 15, tbin_tbl[sv] for sv >= 16
+        const uint32_t rc = T.rem_cw[sc][sv & 15u][zu & 15u];
+        const uint32_t tb = T.tbin_tbl[sv];
+        const uint32_t tk = tb & 15u, tt = tb >> 4;
+        const uint32_t ge = uint32_t(zu >= tt);
+        const uint32_t tcode = zu + (ge ? tt : 0u);
+        const uint32_t tlen  = tk + ge;
+        const bool is_rem = (sv <= uint32_t(REMS));
+        rcode = is_rem ? (rc & 255u) : tcode;
+        rlen  = is_rem ? (rc >> 8)   : tlen;
+#elif RLH9_TBIN_MODE == 1
+        if (__builtin_expect(sv <= uint32_t(REMS), 1)) {
+            const uint32_t rc = T.rem_cw[sc][sv][zu];
+            rcode = rc & 255u; rlen = rc >> 8;
+        } else {
+            const uint32_t tb = T.tbin_tbl[sv];
+            const uint32_t tk = tb & 15u, tt = tb >> 4;
+            const uint32_t ge = uint32_t(zu >= tt);
+            rcode = zu + (ge ? tt : 0u);
+            rlen  = tk + ge;
+        }
+#else
+        if (__builtin_expect(sv <= uint32_t(REMS), 1)) {
+            const uint32_t rc = T.rem_cw[sc][sv][zu];
+            rcode = rc & 255u; rlen = rc >> 8;
+        } else {
+            const uint32_t m = sv + 1u;
+            const uint32_t tk = 31u - uint32_t(__builtin_clz(m));
+            const uint32_t tt = (2u << tk) - m;
+            const uint32_t ge = uint32_t(zu >= tt);
+            rcode = zu + (ge ? tt : 0u);
+            rlen  = tk + ge;
+        }
+#endif
+    }
+
+    // Emit one non-zero Y token into BitW_Fast (single put, max 36 bits)
+    inline void emit_token_y(const Tables& T, const Fsm& M, BitW_Fast& w, uint32_t gb, uint32_t cm, uint32_t cc,
+                             uint32_t& st, uint32_t rl, uint32_t v) {
+        uint32_t rs, rm, rc, rman, cv, vm, vh, vman;
+        enc_run_info(T, rl, rs, rm, rc, rman);
+        enc_val_info(T, v, cv, vm, vh, vman);
+        const uint32_t tc = gb + ctx_of(st, cm, cc);
+        const uint32_t cw = T.enc_cw[tc][rs * NV + cv];
+        const int nm = int(rm + vm);
+        const uint64_t bits = (uint64_t(cw & 0xFFFFu) << nm) | (uint64_t(rman) << vm) | vman;
+        w.put(bits, int(cw >> 16) + nm);
+        st = next_st(M, st, int(vh), int(rc));
+    }
+
+    // Emit one non-zero S token + zU|S into BitW_Fast (single put, max 47 bits)
+    inline void emit_token_s(const Tables& T, const Fsm& M, BitW_Fast& w, uint32_t gb, uint32_t sc, uint32_t cm, uint32_t cc,
+                             uint32_t& st, uint32_t rl, uint32_t sv, uint32_t zu) {
+        uint32_t rs, rm, rc, rman, cv, vm, vh, vman;
+        enc_run_info(T, rl, rs, rm, rc, rman);
+        enc_val_info(T, sv, cv, vm, vh, vman);
+        const uint32_t tc = gb + ctx_of(st, cm, cc);
+        const uint32_t cw = T.enc_cw[tc][rs * NV + cv];
+        const int nm = int(rm + vm);
+        uint32_t rcode, rlen;
+        enc_zu_code(T, sc, sv, zu, rcode, rlen);
+        const uint64_t man = (uint64_t(rman) << vm) | vman;
+        const uint64_t bits = (((uint64_t(cw & 0xFFFFu) << nm) | man) << rlen) | rcode;
+        w.put(bits, int(cw >> 16) + nm + int(rlen));
+        st = next_st(M, st, int(vh), int(rc));
+    }
+
+    inline void emit_eob(const Tables& T, BitW_Fast& w, uint32_t gb, uint32_t cm, uint32_t cc, uint32_t st) {
+        const uint32_t cw = T.enc_cw[gb + ctx_of(st, cm, cc)][EOB];
+        w.put(cw & 0xFFFFu, int(cw >> 16));
+    }
+
+    // Non-zero 16-bit bitmask of 16 uint16_t elements (bit i == 1 iff row[i] != 0)
+    inline uint32_t nz_mask16(const uint16_t* p) {
+#if defined(RLH9_SSE) && defined(__AVX2__)
+        const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+        const __m256i eq = _mm256_cmpeq_epi16(v, _mm256_setzero_si256());
+        const uint32_t m32 = uint32_t(_mm256_movemask_epi8(eq));
+        // Compact even bits of ~m32: pack 16-bit eq into 8-bit via packs_epi16
+        (void)m32;
+        const __m128i lo = _mm256_castsi256_si128(eq);
+        const __m128i hi = _mm256_extracti128_si256(eq, 1);
+        const __m128i pk = _mm_packs_epi16(lo, hi);
+        return uint32_t(~_mm_movemask_epi8(pk)) & 0xFFFFu;
+#elif defined(RLH9_SSE)
+        const __m128i z = _mm_setzero_si128();
+        const __m128i e0 = _mm_cmpeq_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)), z);
+        const __m128i e1 = _mm_cmpeq_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 8)), z);
+        const __m128i pk = _mm_packs_epi16(e0, e1);
+        return uint32_t(~_mm_movemask_epi8(pk)) & 0xFFFFu;
+#else
+        uint32_t m = 0;
+        for (int i = 0; i < 16; ++i) m |= uint32_t(p[i] != 0) << i;
+        return m;
+#endif
+    }
+
+    // Single-lane row encoders: bitmask zero-skip vs simple scan
+    inline void encode_row_y_mask(const Tables& T, const Fsm& M, const uint16_t* row, int W,
+                                  uint32_t gb, uint32_t cm, uint32_t cc, uint32_t& st, BitW_Fast& w) {
+        int x = 0; uint32_t rl = 0;
+        for (; x + 16 <= W; x += 16) {
+            uint32_t m = nz_mask16(row + x);
+            if (!m) { rl += 16; continue; }
+            int prev = 0;
+            while (m) {
+                const int tz = __builtin_ctz(m);
+                rl += uint32_t(tz - prev);
+                emit_token_y(T, M, w, gb, cm, cc, st, rl, row[x + tz]);
+                rl = 0; prev = tz + 1;
+                m &= m - 1u;
+            }
+            rl += uint32_t(16 - prev);
+        }
+        for (; x < W; ++x) {
+            const uint32_t v = row[x];
+            if (!v) { ++rl; continue; }
+            emit_token_y(T, M, w, gb, cm, cc, st, rl, v);
+            rl = 0;
+        }
+        if (rl) emit_eob(T, w, gb, cm, cc, st);
+    }
+
+    inline void encode_row_s_mask(const Tables& T, const Fsm& M, const uint16_t* row, const uint16_t* rowu, int W,
+                                  uint32_t gb, uint32_t sc, uint32_t cm, uint32_t cc, uint32_t& st, BitW_Fast& w) {
+        int x = 0; uint32_t rl = 0;
+        for (; x + 16 <= W; x += 16) {
+            uint32_t m = nz_mask16(row + x);
+            if (!m) { rl += 16; continue; }
+            int prev = 0;
+            while (m) {
+                const int tz = __builtin_ctz(m);
+                rl += uint32_t(tz - prev);
+                const int idx = x + tz;
+                emit_token_s(T, M, w, gb, sc, cm, cc, st, rl, row[idx], rowu[idx]);
+                rl = 0; prev = tz + 1;
+                m &= m - 1u;
+            }
+            rl += uint32_t(16 - prev);
+        }
+        for (; x < W; ++x) {
+            const uint32_t v = row[x];
+            if (!v) { ++rl; continue; }
+            emit_token_s(T, M, w, gb, sc, cm, cc, st, rl, v, rowu[x]);
+            rl = 0;
+        }
+        if (rl) emit_eob(T, w, gb, cm, cc, st);
+    }
+
+    inline void encode_row_y_simple(const Tables& T, const Fsm& M, const uint16_t* row, int W,
+                                    uint32_t gb, uint32_t cm, uint32_t cc, uint32_t& st, BitW_Fast& w) {
+        uint32_t rl = 0;
+        for (int x = 0; x < W; ++x) {
+            const uint32_t v = row[x];
+            if (!v) { ++rl; continue; }
+            emit_token_y(T, M, w, gb, cm, cc, st, rl, v);
+            rl = 0;
+        }
+        if (rl) emit_eob(T, w, gb, cm, cc, st);
+    }
+
+    inline void encode_row_s_simple(const Tables& T, const Fsm& M, const uint16_t* row, const uint16_t* rowu, int W,
+                                    uint32_t gb, uint32_t sc, uint32_t cm, uint32_t cc, uint32_t& st, BitW_Fast& w) {
+        uint32_t rl = 0;
+        for (int x = 0; x < W; ++x) {
+            const uint32_t v = row[x];
+            if (!v) { ++rl; continue; }
+            emit_token_s(T, M, w, gb, sc, cm, cc, st, rl, v, rowu[x]);
+            rl = 0;
+        }
+        if (rl) emit_eob(T, w, gb, cm, cc, st);
+    }
+
+    // 2-lane interleaved stepper state (fits cleanly in GPRs for 2 concurrent lanes)
+    struct LaneCursor {
+        const uint16_t* plane;
+        const uint16_t* plane_u;
+        const uint16_t* row;
+        const uint16_t* rowu;
+        int r, r_end, x, W;
+        uint32_t st;
+        BitW_Fast w;
+
+        void init(const uint16_t* P, const uint16_t* PU, int r0, int r1, int width, uint8_t* dst) {
+            plane = P; plane_u = PU; r = r0; r_end = r1; x = 0; W = width;
+            row = P + size_t(r0) * width;
+            rowu = PU ? (PU + size_t(r0) * width) : nullptr;
+            st = ST0; w = BitW_Fast{dst};
+        }
+        inline void next_row() {
+            ++r; x = 0;
+            row += W;
+            if (rowu) rowu += W;
+        }
+    };
+
+    inline void step_lane_y(const Tables& T, const Fsm& M, LaneCursor& L, uint32_t gb, uint32_t cm, uint32_t cc) {
+        const uint16_t* row = L.row;
+        const int W = L.W;
+        int x = L.x;
+        uint32_t rl = 0;
+        while (x < W && row[x] == 0) { ++x; ++rl; }
+        if (x < W) {
+            emit_token_y(T, M, L.w, gb, cm, cc, L.st, rl, row[x]);
+            L.x = x + 1;
+            if (L.x == W) L.next_row();
+        } else {
+            emit_eob(T, L.w, gb, cm, cc, L.st);
+            L.next_row();
+        }
+    }
+
+    inline void step_lane_s(const Tables& T, const Fsm& M, LaneCursor& L, uint32_t gb, uint32_t sc, uint32_t cm, uint32_t cc) {
+        const uint16_t* row = L.row;
+        const int W = L.W;
+        int x = L.x;
+        uint32_t rl = 0;
+        while (x < W && row[x] == 0) { ++x; ++rl; }
+        if (x < W) {
+            emit_token_s(T, M, L.w, gb, sc, cm, cc, L.st, rl, row[x], L.rowu[x]);
+            L.x = x + 1;
+            if (L.x == W) L.next_row();
+        } else {
+            emit_eob(T, L.w, gb, cm, cc, L.st);
+            L.next_row();
+        }
+    }
 
     // lane l of a band of nb rows: plane (0 = Y, 1 = S) and rows [r0, r1)
     inline void lane_rows(int l, int nb, int& plane, int& r0, int& r1) { const int m = nb / 2; plane = l >> 1; r0 = (l & 1) ? m : 0; r1 = (l & 1) ? nb : m; }
@@ -243,9 +825,10 @@ namespace rlh9
         const Tables& T = tables();
         std::vector<uint8_t> out; out.reserve(size_t(W) * H + 4096);
         Front fe(W);
-        std::vector<uint16_t> bu(size_t(4) * HB * W);
-        const size_t LB = size_t(HB / 2) * W * 8 + 64;   // <= 47 bits per pixel token
+        const size_t LB = size_t(HB / 2) * W * 8 + 64;   // <= 47 bits per pixel token + 8B BitW_Fast slack
         std::vector<uint8_t> lb[NLANE]; for (auto& b : lb) b.resize(LB);
+#if RLH9_ENC_MODE == 0
+        std::vector<uint16_t> bu(size_t(4) * HB * W);
         for (int y0 = 0; y0 < H; y0 += HB) {
             const int nb = std::min(HB, H - y0); const size_t PS = size_t(nb) * W;
             const size_t z = fe.band(rgb, y0, nb, bu.data());
@@ -273,6 +856,128 @@ namespace rlh9
             uint8_t* d = out.data() + o; const uint32_t hd[NLANE] = {ls[0] | sc << 31, ls[1], ls[2], ls[3]}; std::memcpy(d, hd, 4 * NLANE); d += 4 * NLANE;
             for (int l = 0; l < NLANE; ++l) { std::memcpy(d, lb[l].data(), ls[l]); d += ls[l]; }
         }
+#else
+        const Fsm& M = fsm();
+        std::vector<uint16_t> bu(size_t(3) * HB * W);    // U0 (Y), U1 (zU), US (zU+zV)
+        for (int y0 = 0; y0 < H; y0 += HB) {
+            const int nb = std::min(HB, H - y0); const size_t PS = size_t(nb) * W;
+            uint16_t* U0 = bu.data(); uint16_t* U1 = U0 + PS; uint16_t* US = U1 + PS;
+            const size_t z = fe.band_yus(rgb, y0, nb, U0, U1, US);
+            const uint32_t sc = uint32_t(z * 100 >= size_t(RLH9_ZTHR) * 3 * PS);
+            const uint32_t cm = ctx_m(sc), cc = ctx_c(sc);
+            const uint32_t gy = sc * SETC, gs = gy + NCTX;
+            const int m = nb / 2;
+            uint32_t ls[NLANE];
+#if RLH9_ENC_MODE == 2
+            // Idea 1a: 2-lane interleaved homogeneous pairs (Y0+Y1, then S0+S1)
+            if (sc) {
+                for (int l = 0; l < 2; ++l) {
+                    const int r0 = l ? m : 0, r1 = l ? nb : m;
+                    BitW_Fast w{lb[l].data()}; uint32_t st = ST0;
+                    for (int r = r0; r < r1; ++r) encode_row_y_mask(T, M, U0 + size_t(r) * W, W, gy, cm, cc, st, w);
+                    ls[l] = uint32_t(w.flush() - lb[l].data());
+                }
+                for (int l = 2; l < 4; ++l) {
+                    const int r0 = (l & 1) ? m : 0, r1 = (l & 1) ? nb : m;
+                    BitW_Fast w{lb[l].data()}; uint32_t st = ST0;
+                    for (int r = r0; r < r1; ++r) encode_row_s_mask(T, M, US + size_t(r) * W, U1 + size_t(r) * W, W, gs, sc, cm, cc, st, w);
+                    ls[l] = uint32_t(w.flush() - lb[l].data());
+                }
+            } else {
+                LaneCursor L0, L1;
+                L0.init(U0, nullptr, 0, m, W, lb[0].data());
+                L1.init(U0, nullptr, m, nb, W, lb[1].data());
+                while (L0.r < L0.r_end && L1.r < L1.r_end) { step_lane_y(T, M, L0, gy, cm, cc); step_lane_y(T, M, L1, gy, cm, cc); }
+                while (L0.r < L0.r_end) step_lane_y(T, M, L0, gy, cm, cc);
+                while (L1.r < L1.r_end) step_lane_y(T, M, L1, gy, cm, cc);
+                ls[0] = uint32_t(L0.w.flush() - lb[0].data());
+                ls[1] = uint32_t(L1.w.flush() - lb[1].data());
+
+                LaneCursor L2, L3;
+                L2.init(US, U1, 0, m, W, lb[2].data());
+                L3.init(US, U1, m, nb, W, lb[3].data());
+                while (L2.r < L2.r_end && L3.r < L3.r_end) { step_lane_s(T, M, L2, gs, sc, cm, cc); step_lane_s(T, M, L3, gs, sc, cm, cc); }
+                while (L2.r < L2.r_end) step_lane_s(T, M, L2, gs, sc, cm, cc);
+                while (L3.r < L3.r_end) step_lane_s(T, M, L3, gs, sc, cm, cc);
+                ls[2] = uint32_t(L2.w.flush() - lb[2].data());
+                ls[3] = uint32_t(L3.w.flush() - lb[3].data());
+            }
+#elif RLH9_ENC_MODE == 3 || RLH9_ENC_MODE == 7
+            // Idea 1b: 2-lane interleaved mixed pairs (Y0+S0, then Y1+S1)
+            if (sc) {
+                for (int l = 0; l < 2; ++l) {
+                    const int r0 = l ? m : 0, r1 = l ? nb : m;
+                    BitW_Fast w{lb[l].data()}; uint32_t st = ST0;
+                    for (int r = r0; r < r1; ++r) encode_row_y_mask(T, M, U0 + size_t(r) * W, W, gy, cm, cc, st, w);
+                    ls[l] = uint32_t(w.flush() - lb[l].data());
+                }
+                for (int l = 2; l < 4; ++l) {
+                    const int r0 = (l & 1) ? m : 0, r1 = (l & 1) ? nb : m;
+                    BitW_Fast w{lb[l].data()}; uint32_t st = ST0;
+                    for (int r = r0; r < r1; ++r) encode_row_s_mask(T, M, US + size_t(r) * W, U1 + size_t(r) * W, W, gs, sc, cm, cc, st, w);
+                    ls[l] = uint32_t(w.flush() - lb[l].data());
+                }
+            } else {
+                LaneCursor LY0, LS0;
+                LY0.init(U0, nullptr, 0, m, W, lb[0].data());
+                LS0.init(US, U1, 0, m, W, lb[2].data());
+                while (LY0.r < LY0.r_end && LS0.r < LS0.r_end) { step_lane_y(T, M, LY0, gy, cm, cc); step_lane_s(T, M, LS0, gs, sc, cm, cc); }
+                while (LY0.r < LY0.r_end) step_lane_y(T, M, LY0, gy, cm, cc);
+                while (LS0.r < LS0.r_end) step_lane_s(T, M, LS0, gs, sc, cm, cc);
+                ls[0] = uint32_t(LY0.w.flush() - lb[0].data());
+                ls[2] = uint32_t(LS0.w.flush() - lb[2].data());
+
+                LaneCursor LY1, LS1;
+                LY1.init(U0, nullptr, m, nb, W, lb[1].data());
+                LS1.init(US, U1, m, nb, W, lb[3].data());
+                while (LY1.r < LY1.r_end && LS1.r < LS1.r_end) { step_lane_y(T, M, LY1, gy, cm, cc); step_lane_s(T, M, LS1, gs, sc, cm, cc); }
+                while (LY1.r < LY1.r_end) step_lane_y(T, M, LY1, gy, cm, cc);
+                while (LS1.r < LS1.r_end) step_lane_s(T, M, LS1, gs, sc, cm, cc);
+                ls[1] = uint32_t(LY1.w.flush() - lb[1].data());
+                ls[3] = uint32_t(LS1.w.flush() - lb[3].data());
+            }
+#else
+#if RLH9_ENC_MODE == 4 || RLH9_ENC_MODE == 8
+            const bool use_mask = (sc != 0);
+#elif RLH9_ENC_MODE == 5
+            const bool use_mask = (z * 100 >= size_t(RLH9_MASK_THR) * 3 * PS);
+#else
+            const bool use_mask = true;
+#endif
+            if (use_mask) {
+                for (int l = 0; l < 2; ++l) {
+                    const int r0 = l ? m : 0, r1 = l ? nb : m;
+                    BitW_Fast w{lb[l].data()}; uint32_t st = ST0;
+                    for (int r = r0; r < r1; ++r) encode_row_y_mask(T, M, U0 + size_t(r) * W, W, gy, cm, cc, st, w);
+                    ls[l] = uint32_t(w.flush() - lb[l].data());
+                }
+                for (int l = 2; l < 4; ++l) {
+                    const int r0 = (l & 1) ? m : 0, r1 = (l & 1) ? nb : m;
+                    BitW_Fast w{lb[l].data()}; uint32_t st = ST0;
+                    for (int r = r0; r < r1; ++r) encode_row_s_mask(T, M, US + size_t(r) * W, U1 + size_t(r) * W, W, gs, sc, cm, cc, st, w);
+                    ls[l] = uint32_t(w.flush() - lb[l].data());
+                }
+            } else {
+                for (int l = 0; l < 2; ++l) {
+                    const int r0 = l ? m : 0, r1 = l ? nb : m;
+                    BitW_Fast w{lb[l].data()}; uint32_t st = ST0;
+                    for (int r = r0; r < r1; ++r) encode_row_y_simple(T, M, U0 + size_t(r) * W, W, gy, cm, cc, st, w);
+                    ls[l] = uint32_t(w.flush() - lb[l].data());
+                }
+                for (int l = 2; l < 4; ++l) {
+                    const int r0 = (l & 1) ? m : 0, r1 = (l & 1) ? nb : m;
+                    BitW_Fast w{lb[l].data()}; uint32_t st = ST0;
+                    for (int r = r0; r < r1; ++r) encode_row_s_simple(T, M, US + size_t(r) * W, U1 + size_t(r) * W, W, gs, sc, cm, cc, st, w);
+                    ls[l] = uint32_t(w.flush() - lb[l].data());
+                }
+            }
+#endif
+            if (ls[0] >= 0x80000000u) throw std::runtime_error("rlh9: band too large");
+            const size_t o = out.size(); out.resize(o + 4 * NLANE + ls[0] + ls[1] + ls[2] + ls[3]);
+            uint8_t* d = out.data() + o; const uint32_t hd[NLANE] = {ls[0] | sc << 31, ls[1], ls[2], ls[3]}; std::memcpy(d, hd, 4 * NLANE); d += 4 * NLANE;
+            for (int l = 0; l < NLANE; ++l) { std::memcpy(d, lb[l].data(), ls[l]); d += ls[l]; }
+        }
+#endif
         return out;
     }
 
@@ -285,7 +990,6 @@ namespace rlh9
         }
         bad = true; SlowSym r = T.si[EOB]; r.len = 1; return r;
     }
-    // entropy pass of one band: u gets Y, U, V residuals (3 * nb * W, must be zeroed, plus 128 slack); false on a corrupt band
     __attribute__((noinline)) inline bool entropy_band(const Tables& T, const uint8_t* base, uint16_t* const u,
                                                        const uint64_t pos[NLANE], uint32_t W, uint32_t nb, uint32_t sc) {
         const uint32_t PS = W * nb, MW = (nb / 2) * W;
@@ -326,8 +1030,6 @@ namespace rlh9
             } \
         } \
         RLH9_TAIL(Q, QE) } while (0)
-        // S lane: after the S token, zU from the same window (<= 9 + 20 + 11 bits on the fast path):
-        // S <= REMS: RemLUT (6-bit index), else truncated binary of S + 1 values
 #define RLH9_TBIN(WIN, SV, USED, POS, Q) \
             uint32_t uv_; \
             if (__builtin_expect((SV) <= uint32_t(REMS), 1)) { \
@@ -380,8 +1082,6 @@ namespace rlh9
         return !bad;
     }
 
-    // MED reconstruction of n <= 8 rows of one plane: zz residuals U (row stride W) -> P (row stride W), top = the row above
-    // (unused when first: the image row 0 predicts from the left). Afterwards top = the last row.
     inline void recon_scalar(const uint16_t* U, int16_t* P, int16_t* top, int W, int n, bool first) {
         for (int k = 0; k < n; ++k) {
             const uint16_t* u = U + size_t(k) * W; int16_t* c = P + size_t(k) * W; const int16_t* q = k ? P + size_t(k - 1) * W : top;
@@ -401,7 +1101,6 @@ namespace rlh9
         }
         for (int i = 0; i < 4; ++i) { r[2 * i] = _mm_unpacklo_epi64(t1[i], t1[i + 4]); r[2 * i + 1] = _mm_unpackhi_epi64(t1[i], t1[i + 4]); }
     }
-    // 8 rows as a wave: SSE lane k = row k at column d - k (Argon, after the PLS wave decoder). Same result as recon_scalar.
     __attribute__((noinline)) inline void recon_wave8(const uint16_t* U, int16_t* P, int16_t* top, int W, bool first) {
         if (W < 16) { recon_scalar(U, P, top, W, 8, first); return; }
         auto one = [&](int k, int x) {
@@ -446,7 +1145,10 @@ namespace rlh9
                       mG1 = _mm_setr_epi8(5, -1, -1, 6, -1, -1, 7, -1, -1, 8, -1, -1, 9, -1, -1, 10), mB1 = _mm_setr_epi8(-1, 5, -1, -1, 6, -1, -1, 7, -1, -1, 8, -1, -1, 9, -1, -1),
                       mR2 = _mm_setr_epi8(-1, 11, -1, -1, 12, -1, -1, 13, -1, -1, 14, -1, -1, 15, -1, -1), mG2 = _mm_setr_epi8(-1, -1, 11, -1, -1, 12, -1, -1, 13, -1, -1, 14, -1, -1, 15, -1),
                       mB2 = _mm_setr_epi8(10, -1, -1, 11, -1, -1, 12, -1, -1, 13, -1, -1, 14, -1, -1, 15);
-        const __m128i k2 = _mm_set1_epi16(2), m255 = _mm_set1_epi16(255);
+        const __m128i m255 = _mm_set1_epi16(255);
+#if RLH9_RCT == 1
+        const __m128i k2 = _mm_set1_epi16(2);
+#endif
         for (; x + 16 <= W; x += 16) {
             __m128i r8[2], g8[2], b8[2];
             for (int h = 0; h < 2; ++h) {
@@ -477,7 +1179,6 @@ namespace rlh9
         }
     }
 
-    // decode an R8F4 body of n bytes; the buffer must have 8 readable zero bytes after n plus slack (see decode_pad)
     inline size_t decode_pad(int W) { return size_t(W) * HB * 2 * 6 + 64; }
     inline void decode(const uint8_t* base, size_t n, uint8_t* rgb, int W, int H) {
         if (W <= 0 || H <= 0 || uint32_t(W) > MAX_W) throw std::runtime_error("rlh9: bad size");
@@ -512,7 +1213,6 @@ namespace rlh9
 
     // ---------------- training (tools/rlh9) ----------------
     struct Counts { std::vector<double> c = std::vector<double>(size_t(TOTC) * NSYM, 0.0), rem = std::vector<double>(size_t(NSET) * (REMS + 1) * (REMS + 1), 0.0); };
-    // counts per (set, group, ctx, sym); force < 0: band class by the encoder detector, else that set; wt: weight per token
     inline void count(Counts& C, const uint8_t* rgb, int W, int H, int force = -1, double wt = 1.0, uint64_t* nband = nullptr) {
         static Tables* T0 = [] { auto* p = new Tables; p->enc_luts(); return p; }();
         Front fe(W); std::vector<uint16_t> bu(size_t(4) * HB * W);
@@ -539,7 +1239,8 @@ namespace rlh9
         std::vector<double> w(c, c + n); for (auto& x : w) x += 0.5;
         for (;;) {
             std::vector<int> par(size_t(2) * n, -1); using P = std::pair<double, int>; std::priority_queue<P, std::vector<P>, std::greater<P>> q;
-            for (int i = 0; i < n; ++i) q.push({w[i], i}); int nx = n;
+            for (int i = 0; i < n; ++i) q.push({w[i], i});
+            int nx = n;
             while (q.size() > 1) { P a = q.top(); q.pop(); P b = q.top(); q.pop(); par[a.second] = nx; par[b.second] = nx; q.push({a.first + b.first, nx++}); }
             int mx = 0; for (int i = 0; i < n; ++i) { int d = 0; for (int j = i; par[j] >= 0; j = par[j]) ++d; L[i] = uint8_t(d); mx = std::max(mx, d); }
             if (mx <= lim) return;

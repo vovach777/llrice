@@ -46,7 +46,7 @@ Early runs: one split for both sets; tables photos -f 0, screens -f 1 on QOI web
 | V2 (sv >> 2) * 4 + sr bucket {0-1, 2-4, 5-8, 9-15} | 8.9945 | 1.2994* | 1.9673 |
 
 R8F2 uses V1 for the photo set and V0 for the screen set: (st & m) + ((st >> 6) >> c), (m, c) = (62, 3) / (60, 2).
-\* these early screen tables included 6 QOI web pages that are in the 12 screens (leak); compare the columns
+\* these early screen tables included the 6 QOI web pages that are in the 12 screens; compare the columns
 inside this table only.
 
 ## Other knobs
@@ -57,8 +57,11 @@ inside this table only.
   screens by detector 9.0150 / 1.2898* / 1.9789; both forced 9.0050 / 1.2954* / 1.9710 (chosen).
 - Weight 4 for the 4 GUI screens vs 1: 12 screens 1.3161 -> 1.3154, web8 1.9744 -> 1.9738.
 
-## Leaks found
+## Test sets (correction, 2026-11-22)
 
-- Argon's data_screens_train are crops of the web8 pages: his web8 numbers are not held out.
-- The 12 screens are 6 gb82sc + 6 QOI web pages (duckduckgo, en.wikipedia, news.ycombinator, phoboslab, stripe, sublime);
-  training screens on the QOI web set leaks into them (1.2914 dirty vs 1.3154 clean).
+test49 and web8 are Claude's own picks, not the lab split (Google Drive: datasets/). In the lab split the 8 QOI web
+pages of web8 are training data (Argon's data_screens_train, the PLS qhs_tables.h), so "Argon's leak" written here before
+was wrong: his tables were trained on lab training data and Claude measured on it. Real overlap that does matter: the
+12 screens contain 6 QOI web pages (duckduckgo, en.wikipedia, news.ycombinator, phoboslab, stripe, sublime), so screen
+tables must not be trained on them (1.2914 with them vs 1.3154 without, early R8F2 tables). Lab tests: photos
+clic2020_professional_valid (41), clic2025_image_test, Kodak; screens screens_full12_p6.
