@@ -53,6 +53,37 @@
 #define RLH9_FSM_ALU 0
 #endif
 
+// Decoder ablation knobs (format and decoded pixels are 100% invariant)
+// RLH9_DEC_NO_MEMSET: 0 = memset(u, 0), 1 = write zeros on-the-fly during entropy_band
+#ifndef RLH9_DEC_NO_MEMSET
+#define RLH9_DEC_NO_MEMSET 0
+#endif
+// RLH9_DEC_2L_DRAIN: 0 = 4 single-lane drains, 1 = 2-lane Y0+Y1 and S0+S1 drains before 1-lane drains
+#ifndef RLH9_DEC_2L_DRAIN
+#define RLH9_DEC_2L_DRAIN 1
+#endif
+// RLH9_DEC_LUT64: 0 = uint32_t lut + uint8_t lut_cls (2 loads), 1 = single uint64_t lut64 load (packed cls/vmask/sh)
+#ifndef RLH9_DEC_LUT64
+#define RLH9_DEC_LUT64 0
+#endif
+// RLH9_DEC_SLOW_MODE: 0 = original loop decode_slow, 1 = 2-level O(1) sub_lut (64-entry blocks), 2 = SIMD 15-threshold canonical search
+#ifndef RLH9_DEC_SLOW_MODE
+#define RLH9_DEC_SLOW_MODE 1
+#endif
+// RLH9_DEC_TBIN_MODE: 0 = ALU clz (original), 1 = tbin_tbl[2048] LUT + S<=15 branch, 2 = tbin_tbl[2048] branchless cmov
+#ifndef RLH9_DEC_TBIN_MODE
+#define RLH9_DEC_TBIN_MODE 1
+#endif
+// RLH9_DEC_WAVE_MODE: 0 = original SSE2 1-plane wave, 1 = AVX2 2-plane (U+V) wave + Y wave, 2 = fused 3-plane wave + iRCT + RGB24 (no P buffer!)
+#ifndef RLH9_DEC_WAVE_MODE
+#define RLH9_DEC_WAVE_MODE 3
+#endif
+// RLH9_DEC_IRCT_AVX2: 0 = SSSE3 16px irct_row, 1 = AVX2 32px irct_row (used when WAVE_MODE != 2)
+#ifndef RLH9_DEC_IRCT_AVX2
+#define RLH9_DEC_IRCT_AVX2 1
+#endif
+
+
 namespace rlh9
 {
     inline int bw(uint32_t x) { return x ? 32 - __builtin_clz(x) : 0; }
@@ -89,7 +120,7 @@ namespace rlh9
     inline uint32_t ctx_c(uint32_t set) { return set ? 2u : 3u; }
     inline uint32_t ctx_of(uint32_t st, uint32_t m, uint32_t c) { return (st & m) + ((st >> 6) >> c); }
     struct Fsm {
-        uint8_t v[48][16], r[16][8];
+        uint8_t v[48][16], r[16][8]; uint16_t r6[16][8];
         Fsm() {
             static const uint32_t rep_v[16] = {1, 2, 3, 4, 6, 9, 13, 19, 27, 39, 55, 79, 111, 159, 223, 384};
             for (int s = 0; s < 48; ++s) for (int b = 0; b < 16; ++b) {
@@ -99,7 +130,7 @@ namespace rlh9
             }
             static const uint8_t R[16][8] = {{0,1,1,2,3,3,4,4},{1,2,2,3,3,4,5,5},{1,2,3,3,4,5,5,6},{2,3,4,4,5,5,6,7},{3,3,4,5,6,6,7,7},{4,4,5,6,6,7,8,8},{5,5,6,7,7,8,8,9},{5,6,6,7,8,8,9,10},
                                              {6,7,7,8,9,9,10,10},{7,7,8,8,9,10,11,11},{8,8,9,9,10,11,11,12},{8,9,10,10,11,12,12,13},{9,10,10,11,11,12,13,13},{10,10,11,12,12,13,14,14},{10,11,12,12,13,13,14,15},{11,12,13,13,14,14,15,15}};
-            std::memcpy(r, R, sizeof r);
+            std::memcpy(r, R, sizeof r); for (int s = 0; s < 16; ++s) for (int b = 0; b < 8; ++b) r6[s][b] = uint16_t(R[s][b]) << 6;
         }
     };
     inline const Fsm& fsm() { static const Fsm f; return f; }
@@ -144,6 +175,13 @@ namespace rlh9
         uint32_t venc32[2048];
         uint32_t renc32[256];
         uint16_t tbin_tbl[2048];
+        // Fast decoder auxiliary tables:
+#if RLH9_DEC_LUT64 == 1
+        uint64_t lut64[TOTC][1 << LUTB];
+#endif
+        std::vector<uint16_t> sub_lut;                   // 2-level O(1) slow-path table: sym | (len << 10)
+        alignas(32) int16_t lim16[TOTC][16];             // biased 16-bit thresholds for SIMD canonical search
+        uint16_t lim_true_mask[TOTC];                    // bitmask of lanes (0..13) where thresh == 65536
 
         void build_rem(const uint8_t* rl) {
             std::memset(rem_cw, 0, sizeof rem_cw); std::memset(rem_lut, 0, sizeof rem_lut);
@@ -192,6 +230,66 @@ namespace rlh9
                     c <<= 1;
                 }
                 if (ns != uint32_t(NSYM)) throw std::runtime_error("rlh9: incomplete code table");
+                // Build 64-bit packed LUT, 2-level O(1) slow sub_lut, and SIMD 15-threshold lim16
+#if RLH9_DEC_LUT64 == 1
+                std::memset(lut64[tc], 0, sizeof lut64[tc]);
+                for (int k = 0; k < (1 << LUTB); ++k) {
+                    const uint32_t e = lut[tc][k];
+                    if (e) {
+                        const uint32_t cl = lut_cls[tc][k];
+                        const uint32_t nm = (e >> 4) & 31u, vm = (e >> 9) & 7u;
+                        const uint64_t vh = cl & 15u, rc = cl >> 4;
+                        const uint64_t vmask = (1u << vm) - 1u, sh = 63u - nm;
+                        lut64[tc][k] = uint64_t(e) | (vh << 32) | (rc << 36) | (vmask << 40) | (sh << 48);
+                    }
+                }
+#endif
+                // Allocate 64-entry sub_lut blocks for every slow 9-bit prefix (lut[tc][k] == 0)
+                // Store block_idx << 4 in lut[tc][k] and lut64[tc][k] (bits 0..3 stay 0 => slow path!)
+                constexpr int SUBB = MAXL - LUTB; // 6 bits -> 64 entries
+                for (int k = 0; k < (1 << LUTB); ++k) {
+                    if (lut[tc][k] == 0) {
+                        const uint32_t bidx = uint32_t(sub_lut.size() >> SUBB);
+                        sub_lut.resize(sub_lut.size() + (1u << SUBB), 0);
+                        lut[tc][k] = bidx << 4;
+#if RLH9_DEC_LUT64 == 1
+                        lut64[tc][k] = uint64_t(bidx) << 4;
+#endif
+                    }
+                }
+                // Fill sub_lut blocks for all slow symbols (either l > LUTB, or l <= LUTB with e == 0)
+                for (int l = 1; l <= MAXL; ++l) {
+                    const uint32_t cnt = cntl[tc][l], f0 = first[tc][l], o0 = offs[tc][l];
+                    for (uint32_t j = 0; j < cnt; ++j) {
+                        const uint32_t code = f0 + j;
+                        const uint16_t sym = sorted[tc][o0 + j];
+                        const uint16_t val = uint16_t(sym | (uint32_t(l) << 10));
+                        if (l <= LUTB) {
+                            const uint32_t k0 = code << (LUTB - l), k1 = (code + 1u) << (LUTB - l);
+                            for (uint32_t k = k0; k < k1; ++k) {
+                                if ((lut[tc][k] & 15u) == 0) {
+                                    const size_t base = size_t(lut[tc][k] >> 4) << SUBB;
+                                    for (size_t sfx = 0; sfx < (1u << SUBB); ++sfx) sub_lut[base + sfx] = val;
+                                }
+                            }
+                        } else {
+                            const uint32_t k = code >> (l - LUTB);
+                            const uint32_t rem_bits = code & ((1u << (l - LUTB)) - 1u);
+                            const uint32_t s0 = rem_bits << (MAXL - l), s1 = (rem_bits + 1u) << (MAXL - l);
+                            const size_t base = size_t(lut[tc][k] >> 4) << SUBB;
+                            for (uint32_t sfx = s0; sfx < s1; ++sfx) sub_lut[base + sfx] = val;
+                        }
+                    }
+                }
+                // Build SIMD 15-threshold lim16 for l = 1..14 (lane 14,15 padded)
+                uint16_t tmask = 0;
+                for (int l = 1; l <= 14; ++l) {
+                    const uint32_t end_l = (uint32_t(first[tc][l]) + uint32_t(cntl[tc][l])) << (16 - l);
+                    if (end_l >= 65536u) { lim16[tc][l - 1] = 32767; tmask |= uint16_t(1u << (l - 1)); }
+                    else lim16[tc][l - 1] = int16_t(end_l ^ 0x8000u);
+                }
+                lim16[tc][14] = 32767; lim16[tc][15] = 32767;
+                lim_true_mask[tc] = tmask;
             }
             enc_luts();
         }
@@ -983,13 +1081,46 @@ namespace rlh9
 
     // ---------------- decoder ----------------
     inline uint64_t peek(const uint8_t* base, uint64_t pos) { uint64_t w; std::memcpy(&w, base + (pos >> 3), 8); return __builtin_bswap64(w) << (pos & 7); }
-    __attribute__((noinline, cold)) inline SlowSym decode_slow(const Tables& T, uint32_t tc, uint64_t w, bool& bad) {
+
+    __attribute__((noinline, cold)) inline SlowSym decode_slow_loop(const Tables& T, uint32_t tc, uint64_t w, bool& bad) {
         for (int l = 1; l <= MAXL; ++l) {
             const uint32_t v = uint32_t(w >> (64 - l)), f = T.first[tc][l];
             if (v - f < T.cntl[tc][l]) { SlowSym r = T.si[T.sorted[tc][T.offs[tc][l] + v - f]]; r.len = uint8_t(l); return r; }
         }
         bad = true; SlowSym r = T.si[EOB]; r.len = 1; return r;
     }
+
+    inline SlowSym decode_slow_simd(const Tables& T, uint32_t tc, uint64_t w, bool& bad) {
+        const uint32_t v16 = uint32_t(w >> 48);
+        const int16_t vb = int16_t(v16 ^ 0x8000u);
+        uint32_t gt_mask = T.lim_true_mask[tc];
+#if defined(RLH9_SSE) && defined(__AVX2__)
+        const __m256i vvec = _mm256_set1_epi16(vb);
+        const __m256i lim = _mm256_load_si256(reinterpret_cast<const __m256i*>(T.lim16[tc]));
+        const uint32_t m32 = uint32_t(_mm256_movemask_epi8(_mm256_cmpgt_epi16(lim, vvec)));
+        // Every 16-bit lane produces 2 identical bits in m32 -> extract even bits via PEXT or pack
+        const __m128i lo = _mm256_castsi256_si128(_mm256_cmpgt_epi16(lim, vvec));
+        const __m128i hi = _mm256_extracti128_si256(_mm256_cmpgt_epi16(lim, vvec), 1);
+        (void)m32;
+        gt_mask |= uint32_t(_mm_movemask_epi8(_mm_packs_epi16(lo, hi)));
+#elif defined(RLH9_SSE)
+        const __m128i vvec = _mm_set1_epi16(vb);
+        const __m128i c0 = _mm_cmpgt_epi16(_mm_load_si128(reinterpret_cast<const __m128i*>(T.lim16[tc])), vvec);
+        const __m128i c1 = _mm_cmpgt_epi16(_mm_load_si128(reinterpret_cast<const __m128i*>(T.lim16[tc] + 8)), vvec);
+        gt_mask |= uint32_t(_mm_movemask_epi8(_mm_packs_epi16(c0, c1)));
+#else
+        for (int i = 0; i < 14; ++i) gt_mask |= uint32_t(T.lim16[tc][i] > vb) << i;
+#endif
+        const int l = 15 - __builtin_popcount(gt_mask & 0x3FFFu);
+        const uint32_t v = uint32_t(w >> (64 - l)), f = T.first[tc][l];
+        if (__builtin_expect(v - f < T.cntl[tc][l], 1)) {
+            SlowSym r = T.si[T.sorted[tc][T.offs[tc][l] + v - f]];
+            r.len = uint8_t(l);
+            return r;
+        }
+        bad = true; SlowSym r = T.si[EOB]; r.len = 1; return r;
+    }
+
     __attribute__((noinline)) inline bool entropy_band(const Tables& T, const uint8_t* base, uint16_t* const u,
                                                        const uint64_t pos[NLANE], uint32_t W, uint32_t nb, uint32_t sc) {
         const uint32_t PS = W * nb, MW = (nb / 2) * W;
@@ -997,39 +1128,130 @@ namespace rlh9
         uint32_t s0 = ST0, s1 = ST0, s2 = ST0, s3 = ST0;
         uint32_t q0 = 0, qe0 = W, q1 = MW, qe1 = MW + W, q2 = PS, qe2 = PS + W, q3 = PS + MW, qe3 = PS + MW + W;
         const uint32_t e0 = MW, e1 = PS, e2 = PS + MW, e3 = 2 * PS, gy = sc * SETC, gs = gy + NCTX, cm = ctx_m(sc), cc = ctx_c(sc);
-        const uint32_t* const lut = &T.lut[0][0]; const uint8_t* const lcl = &T.lut_cls[0][0]; const uint16_t* const rlut = &T.rem_lut[sc][0][0]; bool bad = false;
+#if RLH9_DEC_LUT64 == 1
+        const uint64_t* const lut64 = &T.lut64[0][0];
+#else
+        const uint32_t* const lut = &T.lut[0][0];
+        const uint8_t* const lcl = &T.lut_cls[0][0];
+#endif
+#if RLH9_DEC_SLOW_MODE == 1
+        const uint16_t* const sub_lut = T.sub_lut.data();
+#endif
+        const uint16_t* const rlut = &T.rem_lut[sc][0][0];
+#if RLH9_DEC_TBIN_MODE >= 1
+        const uint16_t* const tbtbl = T.tbin_tbl;
+#endif
+        bool bad = false;
         const Fsm& M = fsm();
+
+#if RLH9_DEC_NO_MEMSET == 1
+#define RLH9_ZERO_Y(Q, CNT) do { const uint32_t zc_ = (CNT); if (zc_) std::memset(u + (Q), 0, size_t(zc_) * sizeof(uint16_t)); } while (0)
+#define RLH9_ZERO_S(Q, CNT) do { const uint32_t zc_ = (CNT); if (zc_) { std::memset(u + (Q), 0, size_t(zc_) * sizeof(uint16_t)); std::memset(u + (Q) + PS, 0, size_t(zc_) * sizeof(uint16_t)); } } while (0)
+#else
+#define RLH9_ZERO_Y(Q, CNT) do {} while (0)
+#define RLH9_ZERO_S(Q, CNT) do {} while (0)
+#endif
+#if RLH9_DEC_NO_MEMSET == 1
+#define RLH9_PUT_Y(Q, QE, RL, V) if (__builtin_expect((RL) >= (QE) - (Q), 0)) { RLH9_ZERO_Y(Q, (QE) - (Q)); (Q) = (QE); bad = true; } else { RLH9_ZERO_Y(Q, RL); (Q) += (RL); u[(Q)++] = uint16_t(V); }
+#define RLH9_PUT_S(Q, QE, RL, W_, SV_, U_, P_) if (__builtin_expect((RL) >= (QE) - (Q), 0)) { RLH9_ZERO_S(Q, (QE) - (Q)); (Q) = (QE); bad = true; } else { RLH9_ZERO_S(Q, RL); (Q) += (RL); RLH9_TBIN(W_, SV_, U_, P_, Q) }
+#else
+#define RLH9_PUT_Y(Q, QE, RL, V) (Q) += (RL); u[(Q)++] = uint16_t(V);
+#define RLH9_PUT_S(Q, QE, RL, W_, SV_, U_, P_) (Q) += (RL); RLH9_TBIN(W_, SV_, U_, P_, Q)
+#endif
+
+#if RLH9_DEC_LUT64 == 1
+#define RLH9_HEAD(POS, ST, GB) \
+        const uint64_t w_ = peek(base, POS); \
+        const uint32_t tc_ = (GB) + ctx_of(ST, cm, cc); \
+        const size_t li_ = (size_t(tc_) << LUTB) | uint32_t(w_ >> (64 - LUTB)); \
+        const uint64_t e64_ = lut64[li_]; \
+        const uint32_t e_ = uint32_t(e64_);
+#else
 #define RLH9_HEAD(POS, ST, GB) \
         const uint64_t w_ = peek(base, POS); \
         const uint32_t tc_ = (GB) + ctx_of(ST, cm, cc); \
         const size_t li_ = (size_t(tc_) << LUTB) | uint32_t(w_ >> (64 - LUTB)); \
         const uint32_t e_ = lut[li_]; const uint32_t cl_ = lcl[li_];
+#endif
+
+#if RLH9_DEC_SLOW_MODE == 1
+#define RLH9_GET_SLOW(SS) \
+        const uint16_t se_ = sub_lut[(size_t(e_ >> 4) << (MAXL - LUTB)) | uint32_t((w_ >> (64 - MAXL)) & ((1u << (MAXL - LUTB)) - 1u))]; \
+        SlowSym SS = T.si[se_ & 1023u]; SS.len = uint8_t(se_ >> 10);
+#elif RLH9_DEC_SLOW_MODE == 2
+#define RLH9_GET_SLOW(SS) const SlowSym SS = decode_slow_simd(T, tc_, w_, bad);
+#else
+#define RLH9_GET_SLOW(SS) const SlowSym SS = decode_slow_loop(T, tc_, w_, bad);
+#endif
+
 #define RLH9_TAIL(Q, QE) if (__builtin_expect(Q >= QE, 0)) { bad |= Q > QE; Q = QE; QE += W; }
+
+#if RLH9_DEC_LUT64 == 1
+#define RLH9_FAST_DECODE(MVAL, RLVAL, VVAL, ST) \
+        const uint32_t nm_ = (e_ >> 4) & 31u, vm_ = (e_ >> 9) & 7u; \
+        const uint32_t sh_ = uint32_t((e64_ >> 48) & 63u); \
+        const uint32_t MVAL = uint32_t(((w_ << len_) >> 1) >> sh_); \
+        const uint32_t RLVAL = ((e_ >> 23) & 63u) + (MVAL >> vm_); \
+        const uint32_t VVAL = ((e_ >> 12) & 2047u) + (MVAL & uint32_t((e64_ >> 40) & 255u)); \
+        const uint32_t vh_ = uint32_t((e64_ >> 32) & 15u), rc_ = uint32_t((e64_ >> 36) & 7u);
+#define RLH9_UPDATE_ST_FAST(ST) ST = uint32_t(M.v[ST & 63u][vh_]) | uint32_t(M.r6[ST >> 6][rc_]);
+#else
+#define RLH9_FAST_DECODE(MVAL, RLVAL, VVAL, ST) \
+        const uint32_t nm_ = (e_ >> 4) & 31u, vm_ = (e_ >> 9) & 7u; \
+        const uint32_t MVAL = uint32_t(((w_ << len_) >> 1) >> (63 - nm_)); \
+        const uint32_t RLVAL = ((e_ >> 23) & 63u) + (MVAL >> vm_); \
+        const uint32_t VVAL = ((e_ >> 12) & 2047u) + (MVAL & ((1u << vm_) - 1u));
+#define RLH9_UPDATE_ST_FAST(ST) ST = uint32_t(M.v[ST & 63u][cl_ & 15u]) | uint32_t(M.r6[ST >> 6][cl_ >> 4]);
+#endif
+
 #define RLH9_STEP_Y(POS, ST, Q, QE) do { RLH9_HEAD(POS, ST, gy) \
         if (__builtin_expect((e_ & 15u) != 0, 1)) { \
             const uint32_t len_ = e_ & 15u; \
-            if (__builtin_expect(int32_t(e_) < 0, 0)) { POS += len_; Q = QE; } \
+            if (__builtin_expect(int32_t(e_) < 0, 0)) { POS += len_; RLH9_ZERO_Y(Q, QE - Q); Q = QE; } \
             else { \
-                const uint32_t nm_ = (e_ >> 4) & 31u, vm_ = (e_ >> 9) & 7u; \
-                const uint32_t m_ = uint32_t(((w_ << len_) >> 1) >> (63 - nm_)); \
+                RLH9_FAST_DECODE(m_, rl_, v_, ST) \
                 POS += len_ + nm_; \
-                const uint32_t rl_ = ((e_ >> 23) & 63u) + (m_ >> vm_), v_ = ((e_ >> 12) & 2047u) + (m_ & ((1u << vm_) - 1u)); \
-                Q += rl_; u[Q++] = uint16_t(v_); \
-                ST = uint32_t(M.v[ST & 63u][cl_ & 15u]) | (uint32_t(M.r[ST >> 6][cl_ >> 4]) << 6); \
+                RLH9_PUT_Y(Q, QE, rl_, v_) \
+                RLH9_UPDATE_ST_FAST(ST) \
             } \
         } else { \
-            const SlowSym ss_ = decode_slow(T, tc_, w_, bad); \
+            RLH9_GET_SLOW(ss_) \
             const uint32_t m_ = uint32_t(((w_ << ss_.len) >> 1) >> (63 - ss_.nm)); \
             POS += ss_.len + ss_.nm; \
-            if (ss_.eob) Q = QE; \
+            if (ss_.eob) { RLH9_ZERO_Y(Q, QE - Q); Q = QE; } \
             else { \
                 uint32_t rl_ = ss_.rbase + (m_ >> ss_.vm); const uint32_t v_ = ss_.vbase + (m_ & ss_.vmask); \
                 if (rl_ >= QE - Q) { rl_ = QE - Q - 1; bad = true; } \
-                Q += rl_; u[Q++] = uint16_t(v_); \
-                ST = next_st(M, ST, ss_.vh, ss_.rc); \
+                RLH9_ZERO_Y(Q, rl_); Q += rl_; u[Q++] = uint16_t(v_); \
+                ST = uint32_t(M.v[ST & 63u][ss_.vh]) | uint32_t(M.r6[ST >> 6][ss_.rc]); \
             } \
         } \
         RLH9_TAIL(Q, QE) } while (0)
+
+#if RLH9_DEC_TBIN_MODE == 2
+#define RLH9_TBIN(WIN, SV, USED, POS, Q) \
+            const uint64_t tw_ = (WIN) << (USED); \
+            const uint32_t re_ = rlut[(((SV) & 15u) << REMB) | uint32_t(tw_ >> (64 - REMB))]; \
+            const uint32_t tb_ = tbtbl[(SV) & 2047u]; \
+            const uint32_t k_ = tb_ & 15u, t_ = tb_ >> 4; \
+            const uint32_t v2_ = uint32_t(tw_ >> (63u - k_)), v1_ = v2_ >> 1, ge_ = uint32_t(v1_ >= t_); \
+            const bool is_rem_ = ((SV) <= uint32_t(REMS)); \
+            POS += is_rem_ ? (re_ >> 8) : (k_ + ge_); \
+            const uint32_t uv_ = is_rem_ ? (re_ & 255u) : (ge_ ? v2_ - t_ : v1_); \
+            u[Q] = uint16_t(uv_); u[Q + PS] = uint16_t((SV) - uv_); ++Q;
+#elif RLH9_DEC_TBIN_MODE == 1
+#define RLH9_TBIN(WIN, SV, USED, POS, Q) \
+            uint32_t uv_; \
+            if (__builtin_expect((SV) <= uint32_t(REMS), 1)) { \
+                const uint32_t re_ = rlut[((SV) << REMB) | uint32_t(((WIN) << (USED)) >> (64 - REMB))]; \
+                POS += re_ >> 8; uv_ = re_ & 255u; \
+            } else { \
+                const uint32_t tb_ = tbtbl[(SV) & 2047u], k_ = tb_ & 15u, t_ = tb_ >> 4; \
+                const uint32_t v2_ = uint32_t(((WIN) << (USED)) >> (63u - k_)), v1_ = v2_ >> 1, ge_ = uint32_t(v1_ >= t_); \
+                POS += k_ + ge_; uv_ = ge_ ? v2_ - t_ : v1_; \
+            } \
+            u[Q] = uint16_t(uv_); u[Q + PS] = uint16_t((SV) - uv_); ++Q;
+#else
 #define RLH9_TBIN(WIN, SV, USED, POS, Q) \
             uint32_t uv_; \
             if (__builtin_expect((SV) <= uint32_t(REMS), 1)) { \
@@ -1041,35 +1263,39 @@ namespace rlh9
                 POS += k_ + ge_; uv_ = ge_ ? v2_ - t_ : v1_; \
             } \
             u[Q] = uint16_t(uv_); u[Q + PS] = uint16_t((SV) - uv_); ++Q;
+#endif
+
 #define RLH9_STEP_S(POS, ST, Q, QE) do { RLH9_HEAD(POS, ST, gs) \
         if (__builtin_expect((e_ & 15u) != 0, 1)) { \
             const uint32_t len_ = e_ & 15u; \
-            if (__builtin_expect(int32_t(e_) < 0, 0)) { POS += len_; Q = QE; } \
+            if (__builtin_expect(int32_t(e_) < 0, 0)) { POS += len_; RLH9_ZERO_S(Q, QE - Q); Q = QE; } \
             else { \
-                const uint32_t nm_ = (e_ >> 4) & 31u, vm_ = (e_ >> 9) & 7u; \
-                const uint32_t m_ = uint32_t(((w_ << len_) >> 1) >> (63 - nm_)); \
+                RLH9_FAST_DECODE(m_, rl_, sv_, ST) \
                 const uint32_t used_ = len_ + nm_; POS += used_; \
-                const uint32_t rl_ = ((e_ >> 23) & 63u) + (m_ >> vm_), sv_ = ((e_ >> 12) & 2047u) + (m_ & ((1u << vm_) - 1u)); \
-                Q += rl_; \
-                RLH9_TBIN(w_, sv_, used_, POS, Q) \
-                ST = uint32_t(M.v[ST & 63u][cl_ & 15u]) | (uint32_t(M.r[ST >> 6][cl_ >> 4]) << 6); \
+                RLH9_PUT_S(Q, QE, rl_, w_, sv_, used_, POS) \
+                RLH9_UPDATE_ST_FAST(ST) \
             } \
         } else { \
-            const SlowSym ss_ = decode_slow(T, tc_, w_, bad); \
+            RLH9_GET_SLOW(ss_) \
             const uint32_t m_ = uint32_t(((w_ << ss_.len) >> 1) >> (63 - ss_.nm)); \
             POS += ss_.len + ss_.nm; \
-            if (ss_.eob) Q = QE; \
+            if (ss_.eob) { RLH9_ZERO_S(Q, QE - Q); Q = QE; } \
             else { \
                 uint32_t rl_ = ss_.rbase + (m_ >> ss_.vm); const uint32_t sv_ = ss_.vbase + (m_ & ss_.vmask); \
                 if (rl_ >= QE - Q) { rl_ = QE - Q - 1; bad = true; } \
-                Q += rl_; \
+                RLH9_ZERO_S(Q, rl_); Q += rl_; \
                 const uint64_t wr_ = peek(base, POS); \
                 RLH9_TBIN(wr_, sv_, 0u, POS, Q) \
-                ST = next_st(M, ST, ss_.vh, ss_.rc); \
+                ST = uint32_t(M.v[ST & 63u][ss_.vh]) | uint32_t(M.r6[ST >> 6][ss_.rc]); \
             } \
         } \
         RLH9_TAIL(Q, QE) } while (0)
+
         while (q0 < e0 && q1 < e1 && q2 < e2 && q3 < e3) { RLH9_STEP_Y(p0, s0, q0, qe0); RLH9_STEP_Y(p1, s1, q1, qe1); RLH9_STEP_S(p2, s2, q2, qe2); RLH9_STEP_S(p3, s3, q3, qe3); }
+#if RLH9_DEC_2L_DRAIN == 1
+        while (q0 < e0 && q1 < e1) { RLH9_STEP_Y(p0, s0, q0, qe0); RLH9_STEP_Y(p1, s1, q1, qe1); }
+        while (q2 < e2 && q3 < e3) { RLH9_STEP_S(p2, s2, q2, qe2); RLH9_STEP_S(p3, s3, q3, qe3); }
+#endif
         while (q0 < e0) RLH9_STEP_Y(p0, s0, q0, qe0);
         while (q1 < e1) RLH9_STEP_Y(p1, s1, q1, qe1);
         while (q2 < e2) RLH9_STEP_S(p2, s2, q2, qe2);
@@ -1077,8 +1303,13 @@ namespace rlh9
 #undef RLH9_STEP_S
 #undef RLH9_TBIN
 #undef RLH9_STEP_Y
+#undef RLH9_UPDATE_ST_FAST
+#undef RLH9_FAST_DECODE
 #undef RLH9_TAIL
+#undef RLH9_GET_SLOW
 #undef RLH9_HEAD
+#undef RLH9_ZERO_S
+#undef RLH9_ZERO_Y
         return !bad;
     }
 
@@ -1091,6 +1322,7 @@ namespace rlh9
         }
         std::memcpy(top, P + size_t(n - 1) * W, size_t(W) * sizeof(int16_t));
     }
+
 #if defined(RLH9_SSE)
     inline void tr8x8(__m128i r[8]) {
         __m128i t0[8], t1[8];
@@ -1101,6 +1333,19 @@ namespace rlh9
         }
         for (int i = 0; i < 4; ++i) { r[2 * i] = _mm_unpacklo_epi64(t1[i], t1[i + 4]); r[2 * i + 1] = _mm_unpackhi_epi64(t1[i], t1[i + 4]); }
     }
+#if defined(__AVX2__)
+    // Transpose two independent 8x8 int16 matrices in-lane inside 8 x __m256i (low128 = matA, high128 = matB)
+    inline void tr8x8_avx2(__m256i r[8]) {
+        __m256i t0[8], t1[8];
+        for (int i = 0; i < 8; i += 2) { t0[i] = _mm256_unpacklo_epi16(r[i], r[i + 1]); t0[i + 1] = _mm256_unpackhi_epi16(r[i], r[i + 1]); }
+        for (int i = 0; i < 8; i += 4) {
+            t1[i] = _mm256_unpacklo_epi32(t0[i], t0[i + 2]); t1[i + 1] = _mm256_unpackhi_epi32(t0[i], t0[i + 2]);
+            t1[i + 2] = _mm256_unpacklo_epi32(t0[i + 1], t0[i + 3]); t1[i + 3] = _mm256_unpackhi_epi32(t0[i + 1], t0[i + 3]);
+        }
+        for (int i = 0; i < 4; ++i) { r[2 * i] = _mm256_unpacklo_epi64(t1[i], t1[i + 4]); r[2 * i + 1] = _mm256_unpackhi_epi64(t1[i], t1[i + 4]); }
+    }
+#endif
+
     __attribute__((noinline)) inline void recon_wave8(const uint16_t* U, int16_t* P, int16_t* top, int W, bool first) {
         if (W < 16) { recon_scalar(U, P, top, W, 8, first); return; }
         auto one = [&](int k, int x) {
@@ -1136,7 +1381,359 @@ namespace rlh9
         for (int k = 0; k < 8; ++k) for (int x = d0 - k; x < W; ++x) one(k, x);
         std::memcpy(top, P + size_t(7) * W, size_t(W) * sizeof(int16_t));
     }
+
+#if defined(__AVX2__)
+    // Step 5a: Two independent planes (U in low 128, V in high 128) reconstructed simultaneously in one __m256i wave!
+    __attribute__((noinline)) inline void recon_wave8_2p_avx2(const uint16_t* U0, const uint16_t* U1,
+                                                              int16_t* P0, int16_t* P1,
+                                                              int16_t* top0, int16_t* top1, int W, bool first) {
+        if (W < 16) { recon_scalar(U0, P0, top0, W, 8, first); recon_scalar(U1, P1, top1, W, 8, first); return; }
+        auto one = [&](const uint16_t* U, int16_t* P, const int16_t* top, int k, int x) {
+            const int e = uz(U[size_t(k) * W + x]); int pr;
+            if (k == 0 && first) pr = x ? P[x - 1] : 0;
+            else { const int b = k ? P[size_t(k - 1) * W + x] : top[x]; pr = x ? med(P[size_t(k) * W + x - 1], b, k ? P[size_t(k - 1) * W + x - 1] : top[x - 1]) : b; }
+            P[size_t(k) * W + x] = int16_t(pr + e);
+        };
+        for (int k = 0; k < 8; ++k) for (int x = 0; x <= 7 - k; ++x) { one(U0, P0, top0, k, x); one(U1, P1, top1, k, x); }
+        alignas(32) int16_t a1[16], a2[16];
+        for (int k = 0; k < 8; ++k) {
+            a1[k] = P0[size_t(k) * W + (7 - k)]; a2[k] = k <= 6 ? P0[size_t(k) * W + (6 - k)] : 0;
+            a1[8 + k] = P1[size_t(k) * W + (7 - k)]; a2[8 + k] = k <= 6 ? P1[size_t(k) * W + (6 - k)] : 0;
+        }
+        __m256i prev1 = _mm256_load_si256(reinterpret_cast<const __m256i*>(a1));
+        __m256i prev2 = _mm256_load_si256(reinterpret_cast<const __m256i*>(a2));
+        const __m256i one16 = _mm256_set1_epi16(1), zero = _mm256_setzero_si256();
+        int d0 = 8;
+        for (; d0 + 8 <= W; d0 += 8) {
+            __m256i blk[8];
+            for (int k = 0; k < 8; ++k) {
+                const __m128i v0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(U0 + size_t(k) * W + (d0 - k)));
+                const __m128i v1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(U1 + size_t(k) * W + (d0 - k)));
+                const __m256i v = _mm256_set_m128i(v1, v0);
+                blk[k] = _mm256_xor_si256(_mm256_srli_epi16(v, 1), _mm256_sub_epi16(zero, _mm256_and_si256(v, one16)));
+            }
+            tr8x8_avx2(blk);
+            for (int t = 0; t < 8; ++t) {
+                const int d = d0 + t; const __m256i a = prev1;
+                __m256i b = _mm256_slli_si256(prev1, 2);
+                __m256i c = _mm256_slli_si256(prev2, 2);
+                if (!first) {
+                    const __m256i td = _mm256_set_m128i(_mm_cvtsi32_si128(uint16_t(top1[d])), _mm_cvtsi32_si128(uint16_t(top0[d])));
+                    const __m256i tdm = _mm256_set_m128i(_mm_cvtsi32_si128(uint16_t(top1[d - 1])), _mm_cvtsi32_si128(uint16_t(top0[d - 1])));
+                    b = _mm256_or_si256(b, td);
+                    c = _mm256_or_si256(c, tdm);
+                }
+                __m256i pred = _mm256_max_epi16(_mm256_min_epi16(a, b), _mm256_min_epi16(_mm256_max_epi16(a, b), _mm256_sub_epi16(_mm256_add_epi16(a, b), c)));
+                if (first) pred = _mm256_blend_epi16(pred, a, 0x01);
+                const __m256i cur = _mm256_add_epi16(pred, blk[t]); blk[t] = cur; prev2 = prev1; prev1 = cur;
+            }
+            tr8x8_avx2(blk);
+            for (int k = 0; k < 8; ++k) {
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(P0 + size_t(k) * W + (d0 - k)), _mm256_castsi256_si128(blk[k]));
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(P1 + size_t(k) * W + (d0 - k)), _mm256_extracti128_si256(blk[k], 1));
+            }
+        }
+        for (int k = 0; k < 8; ++k) for (int x = d0 - k; x < W; ++x) { one(U0, P0, top0, k, x); one(U1, P1, top1, k, x); }
+        std::memcpy(top0, P0 + size_t(7) * W, size_t(W) * sizeof(int16_t));
+        std::memcpy(top1, P1 + size_t(7) * W, size_t(W) * sizeof(int16_t));
+    }
 #endif
+
+#if defined(__SSSE3__)
+    // Step 5b + 6b: Fused 3-plane Wave MED + iRCT + RGB24 pack directly to rgb (NO P[3] buffer round-trip!)
+    // AVX2 uses 1 x __m256i for U|V + 1 x __m128i for Y; SSE2/SSSE3 uses 3 x __m128i for Y, U, V.
+    __attribute__((noinline)) inline void recon_irct_fused8(
+        const uint16_t* UY, const uint16_t* UU, const uint16_t* UV,
+        int16_t* topY, int16_t* topU, int16_t* topV,
+        uint8_t* rgb_sub, int W, bool first) {
+        // Fallback for narrow widths
+        if (W < 24) {
+            int16_t pY[8 * 24], pU[8 * 24], pV[8 * 24];
+            recon_scalar(UY, pY, topY, W, 8, first);
+            recon_scalar(UU, pU, topU, W, 8, first);
+            recon_scalar(UV, pV, topV, W, 8, first);
+            for (int r = 0; r < 8; ++r) {
+                uint8_t* o = rgb_sub + size_t(r) * W * 3;
+                for (int x = 0; x < W; ++x) {
+                    const int y = pY[r * W + x], uu = pU[r * W + x];
+#if RLH9_RCT == 1
+                    const int v = pV[r * W + x] + (uu >> 2), g = y - ((uu + v + 2) >> 2);
+#else
+                    const int v = pV[r * W + x], g = y - ((uu + v) >> 2);
+#endif
+                    o[3 * x] = uint8_t(uu + g); o[3 * x + 1] = uint8_t(g); o[3 * x + 2] = uint8_t(v + g);
+                }
+            }
+            return;
+        }
+        // Small stack buffer for left wedge (cols 0..7) and right wedge (at most 23 cols)
+        alignas(16) int16_t wY[8][16], wU[8][16], wV[8][16];
+        auto put_px = [&](int k, int x, int y, int uu, int vv) __attribute__((always_inline)) {
+            uint8_t* o = rgb_sub + size_t(k) * W * 3 + size_t(x) * 3;
+#if RLH9_RCT == 1
+            const int v = vv + (uu >> 2), g = y - ((uu + v + 2) >> 2);
+#else
+            const int v = vv, g = y - ((uu + v) >> 2);
+#endif
+            o[0] = uint8_t(uu + g); o[1] = uint8_t(g); o[2] = uint8_t(v + g);
+        };
+        auto one_left = [&](const uint16_t* U, int16_t wbuf[8][16], const int16_t* top, int k, int x) -> int16_t {
+            const int e = uz(U[size_t(k) * W + x]); int pr;
+            if (k == 0 && first) pr = x ? wbuf[0][x - 1] : 0;
+            else { const int b = k ? wbuf[k - 1][x] : top[x]; pr = x ? med(wbuf[k][x - 1], b, k ? wbuf[k - 1][x - 1] : top[x - 1]) : b; }
+            const int16_t val = int16_t(pr + e); wbuf[k][x] = val; return val;
+        };
+        // Left wedge: k = 0..7, x = 0..7-k
+        for (int k = 0; k < 8; ++k) {
+            for (int x = 0; x <= 7 - k; ++x) {
+                const int y = one_left(UY, wY, topY, k, x);
+                const int u = one_left(UU, wU, topU, k, x);
+                const int v = one_left(UV, wV, topV, k, x);
+                put_px(k, x, y, u, v);
+            }
+        }
+        // Save row 7 col 0 for new top (topY/U/V still needed for row 0 at d >= 8, so write to a small staging row or overwrite top[x] once d > x + 1!)
+        // Wait: top[d] is read at column d and top[d-1] at column d, so top[d-7] (row 7's column!) is NEVER read again once d >= d0!
+        // Because row 7 is at column d0 - 7, and we read top[d0..d0+15] and top[d0-1..d0+14], so top[d0-7..d0+8] overlaps top[d0-1..d0+8]!
+        // Therefore keep a tiny 16-element ring delay or separate top_next? Even simpler: store row 7 into top[d0 - 7] ONLY AFTER reading top[d0-1..d0+15] — wait, d0+8 still needs top[d0+7]!
+        // So delay writing top by 8 columns (just 1 __m128i register per plane: pending_topY/U/V!!)!
+        __m128i pend_topY = _mm_setzero_si128(), pend_topU = _mm_setzero_si128(), pend_topV = _mm_setzero_si128();
+        int16_t left_topY = wY[7][0], left_topU = wU[7][0], left_topV = wV[7][0];
+        bool has_pend = false;
+
+        alignas(32) int16_t a1Y[8], a2Y[8], a1UV[16], a2UV[16];
+        for (int k = 0; k < 8; ++k) {
+            a1Y[k] = wY[k][7 - k]; a2Y[k] = k <= 6 ? wY[k][6 - k] : 0;
+            a1UV[k] = wU[k][7 - k]; a2UV[k] = k <= 6 ? wU[k][6 - k] : 0;
+            a1UV[8 + k] = wV[k][7 - k]; a2UV[8 + k] = k <= 6 ? wV[k][6 - k] : 0;
+        }
+
+        const __m128i mR0 = _mm_setr_epi8(0, -1, -1, 1, -1, -1, 2, -1, -1, 3, -1, -1, 4, -1, -1, 5), mG0 = _mm_setr_epi8(-1, 0, -1, -1, 1, -1, -1, 2, -1, -1, 3, -1, -1, 4, -1, -1),
+                      mB0 = _mm_setr_epi8(-1, -1, 0, -1, -1, 1, -1, -1, 2, -1, -1, 3, -1, -1, 4, -1), mR1 = _mm_setr_epi8(-1, -1, 6, -1, -1, 7, -1, -1, 8, -1, -1, 9, -1, -1, 10, -1),
+                      mG1 = _mm_setr_epi8(5, -1, -1, 6, -1, -1, 7, -1, -1, 8, -1, -1, 9, -1, -1, 10), mB1 = _mm_setr_epi8(-1, 5, -1, -1, 6, -1, -1, 7, -1, -1, 8, -1, -1, 9, -1, -1),
+                      mR2 = _mm_setr_epi8(-1, 11, -1, -1, 12, -1, -1, 13, -1, -1, 14, -1, -1, 15, -1, -1), mG2 = _mm_setr_epi8(-1, -1, 11, -1, -1, 12, -1, -1, 13, -1, -1, 14, -1, -1, 15, -1),
+                      mB2 = _mm_setr_epi8(10, -1, -1, 11, -1, -1, 12, -1, -1, 13, -1, -1, 14, -1, -1, 15);
+        const __m128i m255 = _mm_set1_epi16(255), one16_s = _mm_set1_epi16(1), zero_s = _mm_setzero_si128();
+#if RLH9_RCT == 1
+        const __m128i k2_s = _mm_set1_epi16(2);
+#endif
+        auto emit_rgb16 = [&](int k, int col, __m128i y0, __m128i y1, __m128i u0, __m128i u1, __m128i v0, __m128i v1) __attribute__((always_inline)) {
+#if RLH9_RCT == 1
+            v0 = _mm_add_epi16(v0, _mm_srai_epi16(u0, 2));
+            v1 = _mm_add_epi16(v1, _mm_srai_epi16(u1, 2));
+            const __m128i g0 = _mm_sub_epi16(y0, _mm_srai_epi16(_mm_add_epi16(_mm_add_epi16(u0, v0), k2_s), 2));
+            const __m128i g1 = _mm_sub_epi16(y1, _mm_srai_epi16(_mm_add_epi16(_mm_add_epi16(u1, v1), k2_s), 2));
+#else
+            const __m128i g0 = _mm_sub_epi16(y0, _mm_srai_epi16(_mm_add_epi16(u0, v0), 2));
+            const __m128i g1 = _mm_sub_epi16(y1, _mm_srai_epi16(_mm_add_epi16(u1, v1), 2));
+#endif
+            const __m128i r = _mm_packus_epi16(_mm_and_si128(_mm_add_epi16(u0, g0), m255), _mm_and_si128(_mm_add_epi16(u1, g1), m255));
+            const __m128i g = _mm_packus_epi16(_mm_and_si128(g0, m255), _mm_and_si128(g1, m255));
+            const __m128i b = _mm_packus_epi16(_mm_and_si128(_mm_add_epi16(v0, g0), m255), _mm_and_si128(_mm_add_epi16(v1, g1), m255));
+            uint8_t* o = rgb_sub + size_t(k) * W * 3 + size_t(col) * 3;
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(o),      _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(r, mR0), _mm_shuffle_epi8(g, mG0)), _mm_shuffle_epi8(b, mB0)));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(o + 16), _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(r, mR1), _mm_shuffle_epi8(g, mG1)), _mm_shuffle_epi8(b, mB1)));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(o + 32), _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(r, mR2), _mm_shuffle_epi8(g, mG2)), _mm_shuffle_epi8(b, mB2)));
+        };
+
+        __m128i p1Y = _mm_load_si128(reinterpret_cast<const __m128i*>(a1Y));
+        __m128i p2Y = _mm_load_si128(reinterpret_cast<const __m128i*>(a2Y));
+#if defined(__AVX2__)
+        __m256i p1UV = _mm256_load_si256(reinterpret_cast<const __m256i*>(a1UV));
+        __m256i p2UV = _mm256_load_si256(reinterpret_cast<const __m256i*>(a2UV));
+        const __m256i one16_a = _mm256_set1_epi16(1), zero_a = _mm256_setzero_si256();
+#else
+        __m128i p1U = _mm_load_si128(reinterpret_cast<const __m128i*>(a1UV));
+        __m128i p2U = _mm_load_si128(reinterpret_cast<const __m128i*>(a2UV));
+        __m128i p1V = _mm_load_si128(reinterpret_cast<const __m128i*>(a1UV + 8));
+        __m128i p2V = _mm_load_si128(reinterpret_cast<const __m128i*>(a2UV + 8));
+#endif
+        int d0 = 8;
+        for (; d0 + 16 <= W; d0 += 16) {
+            __m128i bY0[8], bY1[8];
+#if defined(__AVX2__)
+            __m256i bUV0[8], bUV1[8];
+            for (int blk_i = 0; blk_i < 2; ++blk_i) {
+                const int db = d0 + blk_i * 8;
+                __m128i* bY = blk_i ? bY1 : bY0;
+                __m256i* bUV = blk_i ? bUV1 : bUV0;
+                for (int k = 0; k < 8; ++k) {
+                    const __m128i vy = _mm_loadu_si128(reinterpret_cast<const __m128i*>(UY + size_t(k) * W + (db - k)));
+                    bY[k] = _mm_xor_si128(_mm_srli_epi16(vy, 1), _mm_sub_epi16(zero_s, _mm_and_si128(vy, one16_s)));
+                    const __m128i vu = _mm_loadu_si128(reinterpret_cast<const __m128i*>(UU + size_t(k) * W + (db - k)));
+                    const __m128i vv = _mm_loadu_si128(reinterpret_cast<const __m128i*>(UV + size_t(k) * W + (db - k)));
+                    const __m256i vuv = _mm256_set_m128i(vv, vu);
+                    bUV[k] = _mm256_xor_si256(_mm256_srli_epi16(vuv, 1), _mm256_sub_epi16(zero_a, _mm256_and_si256(vuv, one16_a)));
+                }
+                tr8x8(bY); tr8x8_avx2(bUV);
+                for (int t = 0; t < 8; ++t) {
+                    const int d = db + t;
+                    // Y wave (SSE2)
+                    const __m128i aY = p1Y;
+                    const __m128i bY_t = _mm_insert_epi16(_mm_slli_si128(p1Y, 2), first ? 0 : topY[d], 0);
+                    const __m128i cY_t = _mm_insert_epi16(_mm_slli_si128(p2Y, 2), first ? 0 : topY[d - 1], 0);
+                    __m128i prY = _mm_max_epi16(_mm_min_epi16(aY, bY_t), _mm_min_epi16(_mm_max_epi16(aY, bY_t), _mm_sub_epi16(_mm_add_epi16(aY, bY_t), cY_t)));
+                    if (first) prY = _mm_insert_epi16(prY, _mm_extract_epi16(aY, 0), 0);
+                    const __m128i curY = _mm_add_epi16(prY, bY[t]); bY[t] = curY; p2Y = p1Y; p1Y = curY;
+                    // U|V wave (AVX2)
+                    const __m256i aUV = p1UV;
+                    __m256i bUV_t = _mm256_slli_si256(p1UV, 2);
+                    __m256i cUV_t = _mm256_slli_si256(p2UV, 2);
+                    if (!first) {
+                        bUV_t = _mm256_or_si256(bUV_t, _mm256_set_m128i(_mm_cvtsi32_si128(uint16_t(topV[d])), _mm_cvtsi32_si128(uint16_t(topU[d]))));
+                        cUV_t = _mm256_or_si256(cUV_t, _mm256_set_m128i(_mm_cvtsi32_si128(uint16_t(topV[d - 1])), _mm_cvtsi32_si128(uint16_t(topU[d - 1]))));
+                    }
+                    __m256i prUV = _mm256_max_epi16(_mm256_min_epi16(aUV, bUV_t), _mm256_min_epi16(_mm256_max_epi16(aUV, bUV_t), _mm256_sub_epi16(_mm256_add_epi16(aUV, bUV_t), cUV_t)));
+                    if (first) prUV = _mm256_blend_epi16(prUV, aUV, 0x01);
+                    const __m256i curUV = _mm256_add_epi16(prUV, bUV[t]); bUV[t] = curUV; p2UV = p1UV; p1UV = curUV;
+                }
+                tr8x8(bY); tr8x8_avx2(bUV);
+            }
+            // Write pending top from previous 8-col block (now safe: d0-15..d0-8 will never be read again!)
+            if (has_pend) {
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(topY + (d0 - 15)), pend_topY);
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(topU + (d0 - 15)), pend_topU);
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(topV + (d0 - 15)), pend_topV);
+            } else {
+                topY[0] = left_topY; topU[0] = left_topU; topV[0] = left_topV;
+                has_pend = true;
+            }
+            // Row 7 block 0 (cols d0-7..d0) is immediately safe to store into top[d0-7..d0] ONLY AFTER d0+8 finished reading top[d0..d0+15]!
+            // Since we just finished BOTH blk 0 and blk 1 (up to d = d0+15), top[d0-7..d0] is safe to store NOW, and blk 1 (cols d0+1..d0+8) is saved as pend_top!
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(topY + (d0 - 7)), bY0[7]);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(topU + (d0 - 7)), _mm256_castsi256_si128(bUV0[7]));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(topV + (d0 - 7)), _mm256_extracti128_si256(bUV0[7], 1));
+            pend_topY = bY1[7];
+            pend_topU = _mm256_castsi256_si128(bUV1[7]);
+            pend_topV = _mm256_extracti128_si256(bUV1[7], 1);
+            for (int k = 0; k < 8; ++k) {
+                emit_rgb16(k, d0 - k, bY0[k], bY1[k],
+                           _mm256_castsi256_si128(bUV0[k]), _mm256_castsi256_si128(bUV1[k]),
+                           _mm256_extracti128_si256(bUV0[k], 1), _mm256_extracti128_si256(bUV1[k], 1));
+            }
+#else
+            __m128i bU0[8], bU1[8], bV0[8], bV1[8];
+            for (int blk_i = 0; blk_i < 2; ++blk_i) {
+                const int db = d0 + blk_i * 8;
+                __m128i* bY = blk_i ? bY1 : bY0;
+                __m128i* bU = blk_i ? bU1 : bU0;
+                __m128i* bV = blk_i ? bV1 : bV0;
+                for (int k = 0; k < 8; ++k) {
+                    const __m128i vy = _mm_loadu_si128(reinterpret_cast<const __m128i*>(UY + size_t(k) * W + (db - k)));
+                    const __m128i vu = _mm_loadu_si128(reinterpret_cast<const __m128i*>(UU + size_t(k) * W + (db - k)));
+                    const __m128i vv = _mm_loadu_si128(reinterpret_cast<const __m128i*>(UV + size_t(k) * W + (db - k)));
+                    bY[k] = _mm_xor_si128(_mm_srli_epi16(vy, 1), _mm_sub_epi16(zero_s, _mm_and_si128(vy, one16_s)));
+                    bU[k] = _mm_xor_si128(_mm_srli_epi16(vu, 1), _mm_sub_epi16(zero_s, _mm_and_si128(vu, one16_s)));
+                    bV[k] = _mm_xor_si128(_mm_srli_epi16(vv, 1), _mm_sub_epi16(zero_s, _mm_and_si128(vv, one16_s)));
+                }
+                tr8x8(bY); tr8x8(bU); tr8x8(bV);
+                for (int t = 0; t < 8; ++t) {
+                    const int d = db + t;
+                    auto step_sse = [&](__m128i& p1, __m128i& p2, const int16_t* tp, __m128i& res) __attribute__((always_inline)) {
+                        const __m128i a = p1;
+                        const __m128i b = _mm_insert_epi16(_mm_slli_si128(p1, 2), first ? 0 : tp[d], 0);
+                        const __m128i c = _mm_insert_epi16(_mm_slli_si128(p2, 2), first ? 0 : tp[d - 1], 0);
+                        __m128i pr = _mm_max_epi16(_mm_min_epi16(a, b), _mm_min_epi16(_mm_max_epi16(a, b), _mm_sub_epi16(_mm_add_epi16(a, b), c)));
+                        if (first) pr = _mm_insert_epi16(pr, _mm_extract_epi16(a, 0), 0);
+                        const __m128i cur = _mm_add_epi16(pr, res); res = cur; p2 = p1; p1 = cur;
+                    };
+                    step_sse(p1Y, p2Y, topY, bY[t]);
+                    step_sse(p1U, p2U, topU, bU[t]);
+                    step_sse(p1V, p2V, topV, bV[t]);
+                }
+                tr8x8(bY); tr8x8(bU); tr8x8(bV);
+            }
+            if (has_pend) {
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(topY + (d0 - 15)), pend_topY);
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(topU + (d0 - 15)), pend_topU);
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(topV + (d0 - 15)), pend_topV);
+            } else {
+                topY[0] = left_topY; topU[0] = left_topU; topV[0] = left_topV;
+                has_pend = true;
+            }
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(topY + (d0 - 7)), bY0[7]);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(topU + (d0 - 7)), bU0[7]);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(topV + (d0 - 7)), bV0[7]);
+            pend_topY = bY1[7]; pend_topU = bU1[7]; pend_topV = bV1[7];
+            for (int k = 0; k < 8; ++k) emit_rgb16(k, d0 - k, bY0[k], bY1[k], bU0[k], bU1[k], bV0[k], bV1[k]);
+#endif
+        }
+        // Right tail: reconstruct columns [d0 - k .. W - 1] for k = 0..7 using prev1/prev2 seed!
+        // First extract prev1 (which holds (k, d0 - 1 - k)) into right-tail buffer rY/rU/rV[8][24]
+        // Indices in rBuf[k]: col = (d0 - 1 - k) is at offset (7 - k) so all rows align cleanly on col - (d0 - 8)!
+        const int base_col = d0 - 8;
+        alignas(16) int16_t rY[8][32], rU[8][32], rV[8][32];
+        alignas(16) int16_t s1Y[8], s1U[8], s1V[8];
+        _mm_store_si128(reinterpret_cast<__m128i*>(s1Y), p1Y);
+#if defined(__AVX2__)
+        _mm_store_si128(reinterpret_cast<__m128i*>(s1U), _mm256_castsi256_si128(p1UV));
+        _mm_store_si128(reinterpret_cast<__m128i*>(s1V), _mm256_extracti128_si256(p1UV, 1));
+#else
+        _mm_store_si128(reinterpret_cast<__m128i*>(s1U), p1U);
+        _mm_store_si128(reinterpret_cast<__m128i*>(s1V), p1V);
+#endif
+        for (int k = 0; k < 8; ++k) {
+            const int x_prev = d0 - 1 - k;
+            rY[k][x_prev - base_col] = s1Y[k];
+            rU[k][x_prev - base_col] = s1U[k];
+            rV[k][x_prev - base_col] = s1V[k];
+        }
+        // We also need row k-1 at column (d0 - k - 1) for the first tail pixel (k, d0 - k) when k >= 1:
+        // Wait: (k-1, d0 - k - 1) is prev2[k-1]! Let's store prev2[0..6] too!
+        alignas(16) int16_t s2Y[8], s2U[8], s2V[8];
+        _mm_store_si128(reinterpret_cast<__m128i*>(s2Y), p2Y);
+#if defined(__AVX2__)
+        _mm_store_si128(reinterpret_cast<__m128i*>(s2U), _mm256_castsi256_si128(p2UV));
+        _mm_store_si128(reinterpret_cast<__m128i*>(s2V), _mm256_extracti128_si256(p2UV, 1));
+#else
+        _mm_store_si128(reinterpret_cast<__m128i*>(s2U), p2U);
+        _mm_store_si128(reinterpret_cast<__m128i*>(s2V), p2V);
+#endif
+        for (int k = 0; k < 7; ++k) {
+            const int x_prev2 = d0 - 2 - k;
+            if (x_prev2 >= base_col) {
+                rY[k][x_prev2 - base_col] = s2Y[k];
+                rU[k][x_prev2 - base_col] = s2U[k];
+                rV[k][x_prev2 - base_col] = s2V[k];
+            }
+        }
+        // Reconstruct tail rows k = 0..7 in order (row 0 reads top[d0-1..W-1], which has NOT been overwritten yet!)
+        for (int k = 0; k < 8; ++k) {
+            for (int x = d0 - k; x < W; ++x) {
+                const int xi = x - base_col;
+                auto step_tail = [&](const uint16_t* U, int16_t rbuf[8][32], const int16_t* tp) -> int16_t {
+                    const int e = uz(U[size_t(k) * W + x]); int pr;
+                    if (k == 0 && first) pr = rbuf[0][xi - 1];
+                    else {
+                        const int b = k ? rbuf[k - 1][xi] : tp[x];
+                        const int c = k ? rbuf[k - 1][xi - 1] : tp[x - 1];
+                        pr = med(rbuf[k][xi - 1], b, c);
+                    }
+                    const int16_t val = int16_t(pr + e); rbuf[k][xi] = val; return val;
+                };
+                const int y = step_tail(UY, rY, topY);
+                const int u = step_tail(UU, rU, topU);
+                const int v = step_tail(UV, rV, topV);
+                put_px(k, x, y, u, v);
+            }
+        }
+        // Flush pending top[d0-15..d0-8] and right tail of row 7 into top[d0-7..W-1]
+        if (has_pend) {
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(topY + (d0 - 15)), pend_topY);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(topU + (d0 - 15)), pend_topU);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(topV + (d0 - 15)), pend_topV);
+        } else {
+            topY[0] = left_topY; topU[0] = left_topU; topV[0] = left_topV;
+        }
+        for (int x = d0 - 7; x < W; ++x) {
+            topY[x] = rY[7][x - base_col];
+            topU[x] = rU[7][x - base_col];
+            topV[x] = rV[7][x - base_col];
+        }
+    }
+#endif
+#endif
+
     inline void irct_row(const int16_t* Y, const int16_t* U, const int16_t* V, uint8_t* o, int W) {
         int x = 0;
 #if defined(RLH9_SSE) && defined(__SSSE3__)
@@ -1145,6 +1742,41 @@ namespace rlh9
                       mG1 = _mm_setr_epi8(5, -1, -1, 6, -1, -1, 7, -1, -1, 8, -1, -1, 9, -1, -1, 10), mB1 = _mm_setr_epi8(-1, 5, -1, -1, 6, -1, -1, 7, -1, -1, 8, -1, -1, 9, -1, -1),
                       mR2 = _mm_setr_epi8(-1, 11, -1, -1, 12, -1, -1, 13, -1, -1, 14, -1, -1, 15, -1, -1), mG2 = _mm_setr_epi8(-1, -1, 11, -1, -1, 12, -1, -1, 13, -1, -1, 14, -1, -1, 15, -1),
                       mB2 = _mm_setr_epi8(10, -1, -1, 11, -1, -1, 12, -1, -1, 13, -1, -1, 14, -1, -1, 15);
+#if defined(__AVX2__) && RLH9_DEC_IRCT_AVX2 == 1
+        const __m256i m255_a = _mm256_set1_epi16(255);
+#if RLH9_RCT == 1
+        const __m256i k2_a = _mm256_set1_epi16(2);
+#endif
+        for (; x + 32 <= W; x += 32) {
+            __m256i r16[2], g16[2], b16[2];
+            for (int h = 0; h < 2; ++h) {
+                const __m256i y = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(Y + x + 16 * h));
+                const __m256i uu = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(U + x + 16 * h));
+                __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(V + x + 16 * h));
+#if RLH9_RCT == 1
+                v = _mm256_add_epi16(v, _mm256_srai_epi16(uu, 2));
+                const __m256i g = _mm256_sub_epi16(y, _mm256_srai_epi16(_mm256_add_epi16(_mm256_add_epi16(uu, v), k2_a), 2));
+#else
+                const __m256i g = _mm256_sub_epi16(y, _mm256_srai_epi16(_mm256_add_epi16(uu, v), 2));
+#endif
+                r16[h] = _mm256_and_si256(_mm256_add_epi16(uu, g), m255_a);
+                g16[h] = _mm256_and_si256(g, m255_a);
+                b16[h] = _mm256_and_si256(_mm256_add_epi16(v, g), m255_a);
+            }
+            // Pack each 16-pixel half cleanly (note _mm256_packus_epi16 interleaves 128-bit lanes, so use _mm256_permute4x64_epi64(0xD8))
+            const __m256i rp = _mm256_permute4x64_epi64(_mm256_packus_epi16(r16[0], r16[1]), 0xD8);
+            const __m256i gp = _mm256_permute4x64_epi64(_mm256_packus_epi16(g16[0], g16[1]), 0xD8);
+            const __m256i bp = _mm256_permute4x64_epi64(_mm256_packus_epi16(b16[0], b16[1]), 0xD8);
+            const __m128i r0 = _mm256_castsi256_si128(rp), g0 = _mm256_castsi256_si128(gp), b0 = _mm256_castsi256_si128(bp);
+            const __m128i r1 = _mm256_extracti128_si256(rp, 1), g1 = _mm256_extracti128_si256(gp, 1), b1 = _mm256_extracti128_si256(bp, 1);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(o + 3 * x),      _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(r0, mR0), _mm_shuffle_epi8(g0, mG0)), _mm_shuffle_epi8(b0, mB0)));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(o + 3 * x + 16), _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(r0, mR1), _mm_shuffle_epi8(g0, mG1)), _mm_shuffle_epi8(b0, mB1)));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(o + 3 * x + 32), _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(r0, mR2), _mm_shuffle_epi8(g0, mG2)), _mm_shuffle_epi8(b0, mB2)));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(o + 3 * x + 48), _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(r1, mR0), _mm_shuffle_epi8(g1, mG0)), _mm_shuffle_epi8(b1, mB0)));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(o + 3 * x + 64), _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(r1, mR1), _mm_shuffle_epi8(g1, mG1)), _mm_shuffle_epi8(b1, mB1)));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(o + 3 * x + 80), _mm_or_si128(_mm_or_si128(_mm_shuffle_epi8(r1, mR2), _mm_shuffle_epi8(g1, mG2)), _mm_shuffle_epi8(b1, mB2)));
+        }
+#endif
         const __m128i m255 = _mm_set1_epi16(255);
 #if RLH9_RCT == 1
         const __m128i k2 = _mm_set1_epi16(2);
@@ -1183,7 +1815,14 @@ namespace rlh9
     inline void decode(const uint8_t* base, size_t n, uint8_t* rgb, int W, int H) {
         if (W <= 0 || H <= 0 || uint32_t(W) > MAX_W) throw std::runtime_error("rlh9: bad size");
         const Tables& T = tables();
-        std::vector<int16_t> top[3], P[3]; for (int p = 0; p < 3; ++p) { top[p].assign(size_t(W), 0); P[p].assign(size_t(8) * W, 0); }
+        std::vector<int16_t> top[3]; for (int p = 0; p < 3; ++p) top[p].assign(size_t(W), 0);
+        std::vector<int16_t> P[3];
+#if defined(RLH9_SSE) && defined(__AVX2__) && RLH9_DEC_WAVE_MODE == 3
+        std::vector<int16_t> P3Y(size_t(8) * W, 0);
+#endif
+#if !(defined(RLH9_SSE) && defined(__SSSE3__) && RLH9_DEC_WAVE_MODE == 2)
+        for (int p = 0; p < 3; ++p) P[p].assign(size_t(8) * W, 0);
+#endif
         std::vector<uint16_t> u(size_t(W) * HB * 3 + 128, 0);
         size_t off = 0;
         for (int y0 = 0; y0 < H; y0 += HB) {
@@ -1194,10 +1833,54 @@ namespace rlh9
             if (uint64_t(ls[0]) + ls[1] + ls[2] + ls[3] > n - off) throw std::runtime_error("rlh9: truncated band");
             uint64_t pos[NLANE]; for (int l = 0; l < NLANE; ++l) { pos[l] = uint64_t(off) * 8; off += ls[l]; }
             const size_t PS = size_t(W) * nb;
+#if RLH9_DEC_NO_MEMSET == 0
             std::memset(u.data(), 0, PS * 3 * sizeof(uint16_t));
+#endif
             if (!entropy_band(T, base, u.data(), pos, uint32_t(W), uint32_t(nb), sc)) throw std::runtime_error("rlh9: corrupt band");
+#if defined(RLH9_SSE) && defined(__AVX2__) && RLH9_DEC_WAVE_MODE == 3
+            if (nb == 16 && y0 > 0) {
+                
+                const uint16_t* UY0 = u.data();
+                const uint16_t* UY1 = UY0 + size_t(8) * W;
+                const uint16_t* UU0 = UY0 + PS;
+                const uint16_t* UU1 = UU0 + size_t(8) * W;
+                const uint16_t* UV0 = UU0 + PS;
+                const uint16_t* UV1 = UV0 + size_t(8) * W;
+                // Pass 1: Y(0..7) + U(0..7)
+                recon_wave8_2p_avx2(UY0, UU0, P[0].data(), P[1].data(), top[0].data(), top[1].data(), W, false);
+                // Pass 2: V(0..7) + Y(8..15) (independent! Y(8..15) uses top[0] just produced by Pass 1)
+                recon_wave8_2p_avx2(UV0, UY1, P[2].data(), P3Y.data(), top[2].data(), top[0].data(), W, false);
+                for (int r = 0; r < 8; ++r)
+                    irct_row(P[0].data() + size_t(r) * W, P[1].data() + size_t(r) * W, P[2].data() + size_t(r) * W, rgb + size_t(y0 + r) * W * 3, W);
+                // Pass 3: U(8..15) + V(8..15)
+                recon_wave8_2p_avx2(UU1, UV1, P[1].data(), P[2].data(), top[1].data(), top[2].data(), W, false);
+                for (int r = 0; r < 8; ++r)
+                    irct_row(P3Y.data() + size_t(r) * W, P[1].data() + size_t(r) * W, P[2].data() + size_t(r) * W, rgb + size_t(y0 + 8 + r) * W * 3, W);
+                continue;
+            }
+#endif
             for (int sub = 0; sub < nb; sub += 8) {
                 const int sn = std::min(8, nb - sub); const bool first = y0 + sub == 0;
+                const uint16_t* UY = u.data() + size_t(sub) * W;
+                const uint16_t* UU = UY + PS;
+                (void)UY; (void)UU; const uint16_t* UV = UU + PS; (void)UV;
+#if defined(RLH9_SSE) && defined(__SSSE3__) && RLH9_DEC_WAVE_MODE == 2
+                if (sn == 8) {
+                    recon_irct_fused8(UY, UU, UV, top[0].data(), top[1].data(), top[2].data(), rgb + size_t(y0 + sub) * W * 3, W, first);
+                    continue;
+                }
+                if (P[0].empty()) for (int p = 0; p < 3; ++p) P[p].assign(size_t(8) * W, 0);
+#endif
+#if defined(RLH9_SSE) && defined(__AVX2__) && RLH9_DEC_WAVE_MODE == 1
+                if (sn == 8) {
+                    recon_wave8(UY, P[0].data(), top[0].data(), W, first);
+                    recon_wave8_2p_avx2(UU, UV, P[1].data(), P[2].data(), top[1].data(), top[2].data(), W, first);
+                } else {
+                    recon_scalar(UY, P[0].data(), top[0].data(), W, sn, first);
+                    recon_scalar(UU, P[1].data(), top[1].data(), W, sn, first);
+                    recon_scalar(UV, P[2].data(), top[2].data(), W, sn, first);
+                }
+#else
                 for (int p = 0; p < 3; ++p) {
                     const uint16_t* U = u.data() + size_t(p) * PS + size_t(sub) * W;
 #if defined(RLH9_SSE)
@@ -1205,6 +1888,7 @@ namespace rlh9
 #endif
                     recon_scalar(U, P[p].data(), top[p].data(), W, sn, first);
                 }
+#endif
                 for (int r = 0; r < sn; ++r)
                     irct_row(P[0].data() + size_t(r) * W, P[1].data() + size_t(r) * W, P[2].data() + size_t(r) * W, rgb + size_t(y0 + sub + r) * W * 3, W);
             }

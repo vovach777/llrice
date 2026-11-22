@@ -58,7 +58,29 @@ tbin_tbl[2048] for the truncated code; ablation macros RLH9_ENC_MODE, RLH9_VENC_
 RLH9_FSM_ALU. Checked by Claude with separate binaries (old encoder from 01a4303 vs new AVX2 / SSE4.2 / -DRLH9_NO_SIMD,
 cmp of the output files): 175 files (90 edge images 1x1..16383x17, valid41, 12 screens, web8, Kodak) x 3 builds, 0 diffs;
 ASan/UBSan clean; the trainer gives identical tables. Encode MB/s, 1 thread: valid41 158 -> 299, 12 screens 421 -> 1700,
-web8 369 -> 1195 (SSE build 279 / 1470 / 1048). Decoder unchanged.
+web8 369 -> 1195 (SSE build 279 / 1470 / 1048).
+Decoder (2026-11-22, Argon's fast decoder, same pixels): slow path (codes > 9 bits) by a 2-level O(1) table sub_lut
+instead of the noinline decode_slow loop (the call made gcc spill the 4 lane registers in the hot loop); 2-lane drains
+Y0+Y1 / S0+S1 before the 1-lane tails; tbin_tbl[2048] for the truncated code; MED wave in 3 full AVX2 passes per 16-row
+band (Y0-7|U0-7, V0-7|Y8-15, U8-15|V8-15) and iRCT AVX2 by 32 px; SSE2/SSSE3 and scalar paths kept. Ablation macros
+RLH9_DEC_NO_MEMSET, RLH9_DEC_2L_DRAIN, RLH9_DEC_LUT64, RLH9_DEC_SLOW_MODE, RLH9_DEC_TBIN_MODE, RLH9_DEC_WAVE_MODE,
+RLH9_DEC_IRCT_AVX2 (lut64 is built only with RLH9_DEC_LUT64=1). Checked by Claude with separate binaries (4ad7ef9
+encoder, old decoder vs new AVX2 / SSE4.2 / -DRLH9_NO_SIMD / LUT64=1, cmp): 175 files x 4 builds, 0 diffs; fuzz under
+ASan/UBSan (tools/rlh9/fuzz_dec.cpp 2 x 5000, plus 1000 mutations on each of 92 edge images and crops), no errors,
+same accepted/rejected streams as the old decoder. tools/rlh9/dec_verify_bin.cpp: Argon's two-binary verifier.
+Decode MB/s, 1 thread, old -> new: valid41 288 -> 310, 12 screens 970 -> 1300, web8 882 -> 1143, Kodak 262 -> 307
+(SSE build 256 -> 278, 918 -> 1064, 814 -> 923, 224 -> 243). Cumulative ablation, AVX2, valid41 / screens / web8:
+| step | valid41 | screens | web8 |
+|---|---|---|---|
+| D0 all off | 282 | 930 | 845 |
+| + 2-lane drains | 295 | 978 | 868 |
+| + sub_lut slow path | 311 | 1101 | 927 |
+| + tbin_tbl | 313 | 1101 | 985 |
+| + AVX2 wave U and V | 311 | 1224 | 1070 |
+| + 3-pass AVX2 wave | 311 | 1295 | 1148 |
+| + AVX2 iRCT (default) | 309 | 1299 | 1155 |
+Not taken: fused wave + iRCT without the P buffer (RLH9_DEC_WAVE_MODE=2) is fastest on valid41 (319-324) but slower on
+screens (-6..-8%), web8 (-5%) and Kodak (-5..-8%); SIMD 15-threshold search (SLOW_MODE=2) loses to sub_lut.
 Bug fixed by R8F3: the R8F1/R8F2 encoder put code + mantissa (up to 35 bits) into a 64-bit accumulator that could hold
 31 pending bits, so a zero run >= 8192 with a long code (images wider than 8192) produced a corrupt stream.
 
