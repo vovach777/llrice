@@ -16,6 +16,10 @@
 #endif
 #ifndef RLH9_NO_TABLES
 #include "rlh9_tables.h"
+#include "r8f5_best48_tables.h"
+#ifndef RLH9_R8F5_2TOK
+#define RLH9_R8F5_2TOK 0
+#endif
 #endif
 
 // Encoder ablation knobs (default: V3_BEST; format and output bytes are 100% invariant)
@@ -83,6 +87,8 @@
 #define RLH9_DEC_IRCT_AVX2 1
 #endif
 
+
+#define RLH9_FMT_NAME "R8F5"
 
 namespace rlh9
 {
@@ -161,6 +167,7 @@ namespace rlh9
         uint32_t enc_cw[TOTC][NSYM];                     // code | len << 16
         uint32_t lut[TOTC][1 << LUTB];
         uint8_t lut_cls[TOTC][1 << LUTB];
+        uint8_t lut_next[TOTC][1 << LUTB];
         uint16_t first[TOTC][MAXL + 2], cntl[TOTC][MAXL + 2], offs[TOTC][MAXL + 2], sorted[TOTC][NSYM];
         SlowSym si[NSYM];
         uint8_t rem_len[NSET][REMS + 1][REMS + 1];
@@ -281,7 +288,19 @@ namespace rlh9
                         }
                     }
                 }
-                // Build SIMD 15-threshold lim16 for l = 1..14 (lane 14,15 padded)
+                // R8F5: fill lut_next[tc][k] = exact next_tc (0..191) directly!
+                const int sc_b = tc / SETC, pl_b = (tc % SETC) / NCTX, c_b = tc % NCTX;
+                const uint8_t gb_b = uint8_t(sc_b * SETC + pl_b * NCTX);
+                for (int k = 0; k < (1 << LUTB); ++k) {
+                    const uint32_t e = lut[tc][k];
+                    if ((e & 15u) != 0) {
+                        if (int32_t(e) < 0) lut_next[tc][k] = uint8_t(tc); // EOB keeps ctx
+                        else lut_next[tc][k] = uint8_t(gb_b + R8F5_TRANS[sc_b][pl_b][c_b][lut_cls[tc][k]]);
+                    } else {
+                        lut_next[tc][k] = uint8_t(tc);
+                    }
+                }
+                                // Build SIMD 15-threshold lim16 for l = 1..14 (lane 14,15 padded)
                 uint16_t tmask = 0;
                 for (int l = 1; l <= 14; ++l) {
                     const uint32_t end_l = (uint32_t(first[tc][l]) + uint32_t(cntl[tc][l])) << (16 - l);
@@ -291,6 +310,37 @@ namespace rlh9
                 lim16[tc][14] = 32767; lim16[tc][15] = 32767;
                 lim_true_mask[tc] = tmask;
             }
+#if RLH9_R8F5_2TOK == 1
+            // Post-pass: fuse 2 short Y tokens (nm1==0, nm2==0, len1+len2 <= LUTB) into 1 LUT lookup!
+            // Bit 30 = 1 marks 2-token entry: len:4 | rl1:3<<4 | v1:2<<7 | rl2:3<<9 | v2:2<<12
+            static uint32_t lut_orig[TOTC][1 << LUTB];
+            static uint8_t lnext_orig[TOTC][1 << LUTB];
+            std::memcpy(lut_orig, lut, sizeof lut);
+            std::memcpy(lnext_orig, lut_next, sizeof lut_next);
+            for (int sc = 0; sc < NSET; ++sc) {
+                for (int c = 0; c < NCTX; ++c) {
+                    const int tc1 = sc * SETC + c; // Y group only (pl == 0)
+                    for (int k = 0; k < (1 << LUTB); ++k) {
+                        const uint32_t e1 = lut_orig[tc1][k];
+                        const uint32_t l1 = e1 & 15u;
+                        if (!l1 || int32_t(e1) < 0) continue;
+                        const uint32_t nm1 = (e1 >> 4) & 31u;
+                        const uint32_t rl1 = (e1 >> 23) & 63u, v1 = (e1 >> 12) & 2047u;
+                        if (nm1 != 0 || rl1 > 7u || v1 == 0 || v1 > 3u || l1 >= uint32_t(LUTB)) continue;
+                        const int tc2 = lnext_orig[tc1][k];
+                        const int k2 = (k << l1) & ((1 << LUTB) - 1);
+                        const uint32_t e2 = lut_orig[tc2][k2];
+                        const uint32_t l2 = e2 & 15u;
+                        if (!l2 || int32_t(e2) < 0 || l1 + l2 > uint32_t(LUTB)) continue;
+                        const uint32_t nm2 = (e2 >> 4) & 31u;
+                        const uint32_t rl2 = (e2 >> 23) & 63u, v2 = (e2 >> 12) & 2047u;
+                        if (nm2 != 0 || rl2 > 7u || v2 == 0 || v2 > 3u) continue;
+                        lut[tc1][k] = (1u << 30) | (l1 + l2) | (rl1 << 4) | (v1 << 7) | (rl2 << 9) | (v2 << 12);
+                        lut_next[tc1][k] = lnext_orig[tc2][k2];
+                    }
+                }
+            }
+#endif
             enc_luts();
         }
         void enc_luts() {
@@ -318,7 +368,7 @@ namespace rlh9
         }
     };
 #ifndef RLH9_NO_TABLES
-    inline const Tables& tables() { static const Tables* t = [] { auto* p = new Tables; p->build(&RLH9_LEN[0][0]); p->build_rem(&RLH9_REMLEN[0][0][0]); return p; }(); return *t; }
+    inline const Tables& tables() { static const Tables* t = [] { auto* p = new Tables; p->build(&R8F5_LEN[0][0]); p->build_rem(&RLH9_REMLEN[0][0][0]); return p; }(); return *t; }
 #else
     const Tables& tables();
 #endif
@@ -728,12 +778,13 @@ namespace rlh9
         uint32_t rs, rm, rc, rman, cv, vm, vh, vman;
         enc_run_info(T, rl, rs, rm, rc, rman);
         enc_val_info(T, v, cv, vm, vh, vman);
-        const uint32_t tc = gb + ctx_of(st, cm, cc);
+        (void)M; (void)cm; (void)cc;
+        const uint32_t tc = gb + st;
         const uint32_t cw = T.enc_cw[tc][rs * NV + cv];
         const int nm = int(rm + vm);
         const uint64_t bits = (uint64_t(cw & 0xFFFFu) << nm) | (uint64_t(rman) << vm) | vman;
         w.put(bits, int(cw >> 16) + nm);
-        st = next_st(M, st, int(vh), int(rc));
+        st = R8F5_TRANS[gb / SETC][0][st][(rc << 4) | vh];
     }
 
     // Emit one non-zero S token + zU|S into BitW_Fast (single put, max 47 bits)
@@ -742,7 +793,8 @@ namespace rlh9
         uint32_t rs, rm, rc, rman, cv, vm, vh, vman;
         enc_run_info(T, rl, rs, rm, rc, rman);
         enc_val_info(T, sv, cv, vm, vh, vman);
-        const uint32_t tc = gb + ctx_of(st, cm, cc);
+        (void)M; (void)cm; (void)cc;
+        const uint32_t tc = gb + st;
         const uint32_t cw = T.enc_cw[tc][rs * NV + cv];
         const int nm = int(rm + vm);
         uint32_t rcode, rlen;
@@ -750,11 +802,11 @@ namespace rlh9
         const uint64_t man = (uint64_t(rman) << vm) | vman;
         const uint64_t bits = (((uint64_t(cw & 0xFFFFu) << nm) | man) << rlen) | rcode;
         w.put(bits, int(cw >> 16) + nm + int(rlen));
-        st = next_st(M, st, int(vh), int(rc));
+        st = R8F5_TRANS[sc][1][st][(rc << 4) | vh];
     }
 
     inline void emit_eob(const Tables& T, BitW_Fast& w, uint32_t gb, uint32_t cm, uint32_t cc, uint32_t st) {
-        const uint32_t cw = T.enc_cw[gb + ctx_of(st, cm, cc)][EOB];
+        (void)cm; (void)cc; const uint32_t cw = T.enc_cw[gb + st][EOB];
         w.put(cw & 0xFFFFu, int(cw >> 16));
     }
 
@@ -934,7 +986,7 @@ namespace rlh9
             uint32_t ls[NLANE];
             for (int l = 0; l < NLANE; ++l) {
                 int plane, r0, r1; lane_rows(l, nb, plane, r0, r1);
-                BitW w{lb[l].data()}; uint32_t st = ST0; const uint32_t gb = sc * SETC + uint32_t(plane) * NCTX;
+                BitW w{lb[l].data()}; uint32_t st = R8F5_INIT_CTX[sc]; const uint32_t gb = sc * SETC + uint32_t(plane) * NCTX;
                 const uint16_t* P = bu.data() + (plane ? 3 * PS : 0); const uint16_t* PU = bu.data() + PS;
                 for (int r = r0; r < r1; ++r) {
                     const uint16_t* row = P + size_t(r) * W; const uint16_t* rowu = PU + size_t(r) * W;
@@ -971,13 +1023,13 @@ namespace rlh9
             if (sc) {
                 for (int l = 0; l < 2; ++l) {
                     const int r0 = l ? m : 0, r1 = l ? nb : m;
-                    BitW_Fast w{lb[l].data()}; uint32_t st = ST0;
+                    BitW_Fast w{lb[l].data()}; uint32_t st = R8F5_INIT_CTX[sc];
                     for (int r = r0; r < r1; ++r) encode_row_y_mask(T, M, U0 + size_t(r) * W, W, gy, cm, cc, st, w);
                     ls[l] = uint32_t(w.flush() - lb[l].data());
                 }
                 for (int l = 2; l < 4; ++l) {
                     const int r0 = (l & 1) ? m : 0, r1 = (l & 1) ? nb : m;
-                    BitW_Fast w{lb[l].data()}; uint32_t st = ST0;
+                    BitW_Fast w{lb[l].data()}; uint32_t st = R8F5_INIT_CTX[sc];
                     for (int r = r0; r < r1; ++r) encode_row_s_mask(T, M, US + size_t(r) * W, U1 + size_t(r) * W, W, gs, sc, cm, cc, st, w);
                     ls[l] = uint32_t(w.flush() - lb[l].data());
                 }
@@ -1005,13 +1057,13 @@ namespace rlh9
             if (sc) {
                 for (int l = 0; l < 2; ++l) {
                     const int r0 = l ? m : 0, r1 = l ? nb : m;
-                    BitW_Fast w{lb[l].data()}; uint32_t st = ST0;
+                    BitW_Fast w{lb[l].data()}; uint32_t st = R8F5_INIT_CTX[sc];
                     for (int r = r0; r < r1; ++r) encode_row_y_mask(T, M, U0 + size_t(r) * W, W, gy, cm, cc, st, w);
                     ls[l] = uint32_t(w.flush() - lb[l].data());
                 }
                 for (int l = 2; l < 4; ++l) {
                     const int r0 = (l & 1) ? m : 0, r1 = (l & 1) ? nb : m;
-                    BitW_Fast w{lb[l].data()}; uint32_t st = ST0;
+                    BitW_Fast w{lb[l].data()}; uint32_t st = R8F5_INIT_CTX[sc];
                     for (int r = r0; r < r1; ++r) encode_row_s_mask(T, M, US + size_t(r) * W, U1 + size_t(r) * W, W, gs, sc, cm, cc, st, w);
                     ls[l] = uint32_t(w.flush() - lb[l].data());
                 }
@@ -1045,26 +1097,26 @@ namespace rlh9
             if (use_mask) {
                 for (int l = 0; l < 2; ++l) {
                     const int r0 = l ? m : 0, r1 = l ? nb : m;
-                    BitW_Fast w{lb[l].data()}; uint32_t st = ST0;
+                    BitW_Fast w{lb[l].data()}; uint32_t st = R8F5_INIT_CTX[sc];
                     for (int r = r0; r < r1; ++r) encode_row_y_mask(T, M, U0 + size_t(r) * W, W, gy, cm, cc, st, w);
                     ls[l] = uint32_t(w.flush() - lb[l].data());
                 }
                 for (int l = 2; l < 4; ++l) {
                     const int r0 = (l & 1) ? m : 0, r1 = (l & 1) ? nb : m;
-                    BitW_Fast w{lb[l].data()}; uint32_t st = ST0;
+                    BitW_Fast w{lb[l].data()}; uint32_t st = R8F5_INIT_CTX[sc];
                     for (int r = r0; r < r1; ++r) encode_row_s_mask(T, M, US + size_t(r) * W, U1 + size_t(r) * W, W, gs, sc, cm, cc, st, w);
                     ls[l] = uint32_t(w.flush() - lb[l].data());
                 }
             } else {
                 for (int l = 0; l < 2; ++l) {
                     const int r0 = l ? m : 0, r1 = l ? nb : m;
-                    BitW_Fast w{lb[l].data()}; uint32_t st = ST0;
+                    BitW_Fast w{lb[l].data()}; uint32_t st = R8F5_INIT_CTX[sc];
                     for (int r = r0; r < r1; ++r) encode_row_y_simple(T, M, U0 + size_t(r) * W, W, gy, cm, cc, st, w);
                     ls[l] = uint32_t(w.flush() - lb[l].data());
                 }
                 for (int l = 2; l < 4; ++l) {
                     const int r0 = (l & 1) ? m : 0, r1 = (l & 1) ? nb : m;
-                    BitW_Fast w{lb[l].data()}; uint32_t st = ST0;
+                    BitW_Fast w{lb[l].data()}; uint32_t st = R8F5_INIT_CTX[sc];
                     for (int r = r0; r < r1; ++r) encode_row_s_simple(T, M, US + size_t(r) * W, U1 + size_t(r) * W, W, gs, sc, cm, cc, st, w);
                     ls[l] = uint32_t(w.flush() - lb[l].data());
                 }
@@ -1125,191 +1177,142 @@ namespace rlh9
                                                        const uint64_t pos[NLANE], uint32_t W, uint32_t nb, uint32_t sc) {
         const uint32_t PS = W * nb, MW = (nb / 2) * W;
         uint64_t p0 = pos[0], p1 = pos[1], p2 = pos[2], p3 = pos[3];
-        uint32_t s0 = ST0, s1 = ST0, s2 = ST0, s3 = ST0;
+        const uint32_t gy = sc * SETC, gs = gy + NCTX;
+        const uint32_t c0 = R8F5_INIT_CTX[sc];
+        uint32_t s0 = gy + c0, s1 = gy + c0, s2 = gs + c0, s3 = gs + c0;
         uint32_t q0 = 0, qe0 = W, q1 = MW, qe1 = MW + W, q2 = PS, qe2 = PS + W, q3 = PS + MW, qe3 = PS + MW + W;
-        const uint32_t e0 = MW, e1 = PS, e2 = PS + MW, e3 = 2 * PS, gy = sc * SETC, gs = gy + NCTX, cm = ctx_m(sc), cc = ctx_c(sc);
-#if RLH9_DEC_LUT64 == 1
-        const uint64_t* const lut64 = &T.lut64[0][0];
-#else
+        const uint32_t e0 = MW, e1 = PS, e2 = PS + MW, e3 = 2 * PS;
         const uint32_t* const lut = &T.lut[0][0];
-        const uint8_t* const lcl = &T.lut_cls[0][0];
-#endif
-#if RLH9_DEC_SLOW_MODE == 1
+        const uint8_t* const lnext = &T.lut_next[0][0];
         const uint16_t* const sub_lut = T.sub_lut.data();
-#endif
         const uint16_t* const rlut = &T.rem_lut[sc][0][0];
-#if RLH9_DEC_TBIN_MODE >= 1
         const uint16_t* const tbtbl = T.tbin_tbl;
-#endif
+        const auto& TY = R8F5_TRANS[sc][0];
+        const auto& TS = R8F5_TRANS[sc][1];
         bool bad = false;
-        const Fsm& M = fsm();
 
-#if RLH9_DEC_NO_MEMSET == 1
-#define RLH9_ZERO_Y(Q, CNT) do { const uint32_t zc_ = (CNT); if (zc_) std::memset(u + (Q), 0, size_t(zc_) * sizeof(uint16_t)); } while (0)
-#define RLH9_ZERO_S(Q, CNT) do { const uint32_t zc_ = (CNT); if (zc_) { std::memset(u + (Q), 0, size_t(zc_) * sizeof(uint16_t)); std::memset(u + (Q) + PS, 0, size_t(zc_) * sizeof(uint16_t)); } } while (0)
-#else
-#define RLH9_ZERO_Y(Q, CNT) do {} while (0)
-#define RLH9_ZERO_S(Q, CNT) do {} while (0)
-#endif
-#if RLH9_DEC_NO_MEMSET == 1
-#define RLH9_PUT_Y(Q, QE, RL, V) if (__builtin_expect((RL) >= (QE) - (Q), 0)) { RLH9_ZERO_Y(Q, (QE) - (Q)); (Q) = (QE); bad = true; } else { RLH9_ZERO_Y(Q, RL); (Q) += (RL); u[(Q)++] = uint16_t(V); }
-#define RLH9_PUT_S(Q, QE, RL, W_, SV_, U_, P_) if (__builtin_expect((RL) >= (QE) - (Q), 0)) { RLH9_ZERO_S(Q, (QE) - (Q)); (Q) = (QE); bad = true; } else { RLH9_ZERO_S(Q, RL); (Q) += (RL); RLH9_TBIN(W_, SV_, U_, P_, Q) }
-#else
-#define RLH9_PUT_Y(Q, QE, RL, V) (Q) += (RL); u[(Q)++] = uint16_t(V);
-#define RLH9_PUT_S(Q, QE, RL, W_, SV_, U_, P_) (Q) += (RL); RLH9_TBIN(W_, SV_, U_, P_, Q)
-#endif
-
-#if RLH9_DEC_LUT64 == 1
-#define RLH9_HEAD(POS, ST, GB) \
+#define R5_HEAD(POS, TC) \
         const uint64_t w_ = peek(base, POS); \
-        const uint32_t tc_ = (GB) + ctx_of(ST, cm, cc); \
-        const size_t li_ = (size_t(tc_) << LUTB) | uint32_t(w_ >> (64 - LUTB)); \
-        const uint64_t e64_ = lut64[li_]; \
-        const uint32_t e_ = uint32_t(e64_);
-#else
-#define RLH9_HEAD(POS, ST, GB) \
-        const uint64_t w_ = peek(base, POS); \
-        const uint32_t tc_ = (GB) + ctx_of(ST, cm, cc); \
-        const size_t li_ = (size_t(tc_) << LUTB) | uint32_t(w_ >> (64 - LUTB)); \
-        const uint32_t e_ = lut[li_]; const uint32_t cl_ = lcl[li_];
-#endif
+        const size_t li_ = (size_t(TC) << LUTB) | uint32_t(w_ >> (64 - LUTB)); \
+        const uint32_t e_ = lut[li_]; const uint32_t ntc_ = lnext[li_];
 
-#if RLH9_DEC_SLOW_MODE == 1
-#define RLH9_GET_SLOW(SS) \
-        const uint16_t se_ = sub_lut[(size_t(e_ >> 4) << (MAXL - LUTB)) | uint32_t((w_ >> (64 - MAXL)) & ((1u << (MAXL - LUTB)) - 1u))]; \
-        SlowSym SS = T.si[se_ & 1023u]; SS.len = uint8_t(se_ >> 10);
-#elif RLH9_DEC_SLOW_MODE == 2
-#define RLH9_GET_SLOW(SS) const SlowSym SS = decode_slow_simd(T, tc_, w_, bad);
-#else
-#define RLH9_GET_SLOW(SS) const SlowSym SS = decode_slow_loop(T, tc_, w_, bad);
-#endif
+#define R5_TAIL(Q, QE) if (__builtin_expect(Q >= QE, 0)) { bad |= Q > QE; Q = QE; QE += W; }
 
-#define RLH9_TAIL(Q, QE) if (__builtin_expect(Q >= QE, 0)) { bad |= Q > QE; Q = QE; QE += W; }
-
-#if RLH9_DEC_LUT64 == 1
-#define RLH9_FAST_DECODE(MVAL, RLVAL, VVAL, ST) \
-        const uint32_t nm_ = (e_ >> 4) & 31u, vm_ = (e_ >> 9) & 7u; \
-        const uint32_t sh_ = uint32_t((e64_ >> 48) & 63u); \
-        const uint32_t MVAL = uint32_t(((w_ << len_) >> 1) >> sh_); \
-        const uint32_t RLVAL = ((e_ >> 23) & 63u) + (MVAL >> vm_); \
-        const uint32_t VVAL = ((e_ >> 12) & 2047u) + (MVAL & uint32_t((e64_ >> 40) & 255u)); \
-        const uint32_t vh_ = uint32_t((e64_ >> 32) & 15u), rc_ = uint32_t((e64_ >> 36) & 7u);
-#define RLH9_UPDATE_ST_FAST(ST) ST = uint32_t(M.v[ST & 63u][vh_]) | uint32_t(M.r6[ST >> 6][rc_]);
-#else
-#define RLH9_FAST_DECODE(MVAL, RLVAL, VVAL, ST) \
-        const uint32_t nm_ = (e_ >> 4) & 31u, vm_ = (e_ >> 9) & 7u; \
-        const uint32_t MVAL = uint32_t(((w_ << len_) >> 1) >> (63 - nm_)); \
-        const uint32_t RLVAL = ((e_ >> 23) & 63u) + (MVAL >> vm_); \
-        const uint32_t VVAL = ((e_ >> 12) & 2047u) + (MVAL & ((1u << vm_) - 1u));
-#define RLH9_UPDATE_ST_FAST(ST) ST = uint32_t(M.v[ST & 63u][cl_ & 15u]) | uint32_t(M.r6[ST >> 6][cl_ >> 4]);
-#endif
-
-#define RLH9_STEP_Y(POS, ST, Q, QE) do { RLH9_HEAD(POS, ST, gy) \
+#if RLH9_R8F5_2TOK == 1
+#define R5_STEP_Y(POS, TC, Q, QE) do { R5_HEAD(POS, TC) \
         if (__builtin_expect((e_ & 15u) != 0, 1)) { \
             const uint32_t len_ = e_ & 15u; \
-            if (__builtin_expect(int32_t(e_) < 0, 0)) { POS += len_; RLH9_ZERO_Y(Q, QE - Q); Q = QE; } \
+            if (__builtin_expect((e_ & (1u << 30)) != 0, 0)) { \
+                POS += len_; \
+                Q += (e_ >> 4) & 7u; u[Q++] = uint16_t((e_ >> 7) & 3u); \
+                if (__builtin_expect(Q >= QE, 0)) { bad |= Q > QE; Q = QE; QE += W; } \
+                Q += (e_ >> 9) & 7u; u[Q++] = uint16_t((e_ >> 12) & 3u); \
+                TC = ntc_; \
+            } else if (__builtin_expect(int32_t(e_) < 0, 0)) { POS += len_; Q = QE; } \
             else { \
-                RLH9_FAST_DECODE(m_, rl_, v_, ST) \
+                const uint32_t nm_ = (e_ >> 4) & 31u, vm_ = (e_ >> 9) & 7u; \
+                const uint32_t m_ = uint32_t(((w_ << len_) >> 1) >> (63 - nm_)); \
                 POS += len_ + nm_; \
-                RLH9_PUT_Y(Q, QE, rl_, v_) \
-                RLH9_UPDATE_ST_FAST(ST) \
+                const uint32_t rl_ = ((e_ >> 23) & 63u) + (m_ >> vm_), v_ = ((e_ >> 12) & 2047u) + (m_ & ((1u << vm_) - 1u)); \
+                Q += rl_; u[Q++] = uint16_t(v_); \
+                TC = ntc_; \
             } \
         } else { \
-            RLH9_GET_SLOW(ss_) \
-            const uint32_t m_ = uint32_t(((w_ << ss_.len) >> 1) >> (63 - ss_.nm)); \
-            POS += ss_.len + ss_.nm; \
-            if (ss_.eob) { RLH9_ZERO_Y(Q, QE - Q); Q = QE; } \
+            const uint16_t se_ = sub_lut[(size_t(e_ >> 4) << (MAXL - LUTB)) | uint32_t((w_ >> (64 - MAXL)) & ((1u << (MAXL - LUTB)) - 1u))]; \
+            const SlowSym& ss_ = T.si[se_ & 1023u]; const uint32_t sl_ = se_ >> 10; \
+            const uint32_t m_ = uint32_t(((w_ << sl_) >> 1) >> (63 - ss_.nm)); \
+            POS += sl_ + ss_.nm; \
+            if (ss_.eob) Q = QE; \
             else { \
                 uint32_t rl_ = ss_.rbase + (m_ >> ss_.vm); const uint32_t v_ = ss_.vbase + (m_ & ss_.vmask); \
                 if (rl_ >= QE - Q) { rl_ = QE - Q - 1; bad = true; } \
-                RLH9_ZERO_Y(Q, rl_); Q += rl_; u[Q++] = uint16_t(v_); \
-                ST = uint32_t(M.v[ST & 63u][ss_.vh]) | uint32_t(M.r6[ST >> 6][ss_.rc]); \
+                Q += rl_; u[Q++] = uint16_t(v_); \
+                TC = gy + TY[TC - gy][(ss_.rc << 4) | ss_.vh]; \
             } \
         } \
-        RLH9_TAIL(Q, QE) } while (0)
-
-#if RLH9_DEC_TBIN_MODE == 2
-#define RLH9_TBIN(WIN, SV, USED, POS, Q) \
-            const uint64_t tw_ = (WIN) << (USED); \
-            const uint32_t re_ = rlut[(((SV) & 15u) << REMB) | uint32_t(tw_ >> (64 - REMB))]; \
-            const uint32_t tb_ = tbtbl[(SV) & 2047u]; \
-            const uint32_t k_ = tb_ & 15u, t_ = tb_ >> 4; \
-            const uint32_t v2_ = uint32_t(tw_ >> (63u - k_)), v1_ = v2_ >> 1, ge_ = uint32_t(v1_ >= t_); \
-            const bool is_rem_ = ((SV) <= uint32_t(REMS)); \
-            POS += is_rem_ ? (re_ >> 8) : (k_ + ge_); \
-            const uint32_t uv_ = is_rem_ ? (re_ & 255u) : (ge_ ? v2_ - t_ : v1_); \
-            u[Q] = uint16_t(uv_); u[Q + PS] = uint16_t((SV) - uv_); ++Q;
-#elif RLH9_DEC_TBIN_MODE == 1
-#define RLH9_TBIN(WIN, SV, USED, POS, Q) \
-            uint32_t uv_; \
-            if (__builtin_expect((SV) <= uint32_t(REMS), 1)) { \
-                const uint32_t re_ = rlut[((SV) << REMB) | uint32_t(((WIN) << (USED)) >> (64 - REMB))]; \
-                POS += re_ >> 8; uv_ = re_ & 255u; \
-            } else { \
-                const uint32_t tb_ = tbtbl[(SV) & 2047u], k_ = tb_ & 15u, t_ = tb_ >> 4; \
-                const uint32_t v2_ = uint32_t(((WIN) << (USED)) >> (63u - k_)), v1_ = v2_ >> 1, ge_ = uint32_t(v1_ >= t_); \
-                POS += k_ + ge_; uv_ = ge_ ? v2_ - t_ : v1_; \
-            } \
-            u[Q] = uint16_t(uv_); u[Q + PS] = uint16_t((SV) - uv_); ++Q;
+        R5_TAIL(Q, QE) } while (0)
 #else
-#define RLH9_TBIN(WIN, SV, USED, POS, Q) \
-            uint32_t uv_; \
-            if (__builtin_expect((SV) <= uint32_t(REMS), 1)) { \
-                const uint32_t re_ = rlut[((SV) << REMB) | uint32_t(((WIN) << (USED)) >> (64 - REMB))]; \
-                POS += re_ >> 8; uv_ = re_ & 255u; \
-            } else { \
-                const uint32_t mm_ = (SV) + 1u, k_ = 31u - uint32_t(__builtin_clz(mm_)), t_ = (2u << k_) - mm_; \
-                const uint32_t v2_ = uint32_t(((WIN) << (USED)) >> (63u - k_)), v1_ = v2_ >> 1, ge_ = uint32_t(v1_ >= t_); \
-                POS += k_ + ge_; uv_ = ge_ ? v2_ - t_ : v1_; \
-            } \
-            u[Q] = uint16_t(uv_); u[Q + PS] = uint16_t((SV) - uv_); ++Q;
-#endif
-
-#define RLH9_STEP_S(POS, ST, Q, QE) do { RLH9_HEAD(POS, ST, gs) \
+#define R5_STEP_Y(POS, TC, Q, QE) do { R5_HEAD(POS, TC) \
         if (__builtin_expect((e_ & 15u) != 0, 1)) { \
             const uint32_t len_ = e_ & 15u; \
-            if (__builtin_expect(int32_t(e_) < 0, 0)) { POS += len_; RLH9_ZERO_S(Q, QE - Q); Q = QE; } \
+            if (__builtin_expect(int32_t(e_) < 0, 0)) { POS += len_; Q = QE; } \
             else { \
-                RLH9_FAST_DECODE(m_, rl_, sv_, ST) \
-                const uint32_t used_ = len_ + nm_; POS += used_; \
-                RLH9_PUT_S(Q, QE, rl_, w_, sv_, used_, POS) \
-                RLH9_UPDATE_ST_FAST(ST) \
+                const uint32_t nm_ = (e_ >> 4) & 31u, vm_ = (e_ >> 9) & 7u; \
+                const uint32_t m_ = uint32_t(((w_ << len_) >> 1) >> (63 - nm_)); \
+                POS += len_ + nm_; \
+                const uint32_t rl_ = ((e_ >> 23) & 63u) + (m_ >> vm_), v_ = ((e_ >> 12) & 2047u) + (m_ & ((1u << vm_) - 1u)); \
+                Q += rl_; u[Q++] = uint16_t(v_); \
+                TC = ntc_; \
             } \
         } else { \
-            RLH9_GET_SLOW(ss_) \
-            const uint32_t m_ = uint32_t(((w_ << ss_.len) >> 1) >> (63 - ss_.nm)); \
-            POS += ss_.len + ss_.nm; \
-            if (ss_.eob) { RLH9_ZERO_S(Q, QE - Q); Q = QE; } \
+            const uint16_t se_ = sub_lut[(size_t(e_ >> 4) << (MAXL - LUTB)) | uint32_t((w_ >> (64 - MAXL)) & ((1u << (MAXL - LUTB)) - 1u))]; \
+            const SlowSym& ss_ = T.si[se_ & 1023u]; const uint32_t sl_ = se_ >> 10; \
+            const uint32_t m_ = uint32_t(((w_ << sl_) >> 1) >> (63 - ss_.nm)); \
+            POS += sl_ + ss_.nm; \
+            if (ss_.eob) Q = QE; \
+            else { \
+                uint32_t rl_ = ss_.rbase + (m_ >> ss_.vm); const uint32_t v_ = ss_.vbase + (m_ & ss_.vmask); \
+                if (rl_ >= QE - Q) { rl_ = QE - Q - 1; bad = true; } \
+                Q += rl_; u[Q++] = uint16_t(v_); \
+                TC = gy + TY[TC - gy][(ss_.rc << 4) | ss_.vh]; \
+            } \
+        } \
+        R5_TAIL(Q, QE) } while (0)
+#endif
+
+#define R5_TBIN(WIN, SV, USED, POS, Q) \
+        uint32_t uv_; \
+        if (__builtin_expect((SV) <= uint32_t(REMS), 1)) { \
+            const uint32_t re_ = rlut[((SV) << REMB) | uint32_t(((WIN) << (USED)) >> (64 - REMB))]; \
+            POS += re_ >> 8; uv_ = re_ & 255u; \
+        } else { \
+            const uint32_t tb_ = tbtbl[(SV) & 2047u], k_ = tb_ & 15u, t_ = tb_ >> 4; \
+            const uint32_t v2_ = uint32_t(((WIN) << (USED)) >> (63u - k_)), v1_ = v2_ >> 1, ge_ = uint32_t(v1_ >= t_); \
+            POS += k_ + ge_; uv_ = ge_ ? v2_ - t_ : v1_; \
+        } \
+        u[Q] = uint16_t(uv_); u[Q + PS] = uint16_t((SV) - uv_); ++Q;
+
+#define R5_STEP_S(POS, TC, Q, QE) do { R5_HEAD(POS, TC) \
+        if (__builtin_expect((e_ & 15u) != 0, 1)) { \
+            const uint32_t len_ = e_ & 15u; \
+            if (__builtin_expect(int32_t(e_) < 0, 0)) { POS += len_; Q = QE; } \
+            else { \
+                const uint32_t nm_ = (e_ >> 4) & 31u, vm_ = (e_ >> 9) & 7u; \
+                const uint32_t m_ = uint32_t(((w_ << len_) >> 1) >> (63 - nm_)); \
+                const uint32_t used_ = len_ + nm_; POS += used_; \
+                const uint32_t rl_ = ((e_ >> 23) & 63u) + (m_ >> vm_), sv_ = ((e_ >> 12) & 2047u) + (m_ & ((1u << vm_) - 1u)); \
+                Q += rl_; R5_TBIN(w_, sv_, used_, POS, Q) \
+                TC = ntc_; \
+            } \
+        } else { \
+            const uint16_t se_ = sub_lut[(size_t(e_ >> 4) << (MAXL - LUTB)) | uint32_t((w_ >> (64 - MAXL)) & ((1u << (MAXL - LUTB)) - 1u))]; \
+            const SlowSym& ss_ = T.si[se_ & 1023u]; const uint32_t sl_ = se_ >> 10; \
+            const uint32_t m_ = uint32_t(((w_ << sl_) >> 1) >> (63 - ss_.nm)); \
+            POS += sl_ + ss_.nm; \
+            if (ss_.eob) Q = QE; \
             else { \
                 uint32_t rl_ = ss_.rbase + (m_ >> ss_.vm); const uint32_t sv_ = ss_.vbase + (m_ & ss_.vmask); \
                 if (rl_ >= QE - Q) { rl_ = QE - Q - 1; bad = true; } \
-                RLH9_ZERO_S(Q, rl_); Q += rl_; \
+                Q += rl_; \
                 const uint64_t wr_ = peek(base, POS); \
-                RLH9_TBIN(wr_, sv_, 0u, POS, Q) \
-                ST = uint32_t(M.v[ST & 63u][ss_.vh]) | uint32_t(M.r6[ST >> 6][ss_.rc]); \
+                R5_TBIN(wr_, sv_, 0u, POS, Q) \
+                TC = gs + TS[TC - gs][(ss_.rc << 4) | ss_.vh]; \
             } \
         } \
-        RLH9_TAIL(Q, QE) } while (0)
+        R5_TAIL(Q, QE) } while (0)
 
-        while (q0 < e0 && q1 < e1 && q2 < e2 && q3 < e3) { RLH9_STEP_Y(p0, s0, q0, qe0); RLH9_STEP_Y(p1, s1, q1, qe1); RLH9_STEP_S(p2, s2, q2, qe2); RLH9_STEP_S(p3, s3, q3, qe3); }
-#if RLH9_DEC_2L_DRAIN == 1
-        while (q0 < e0 && q1 < e1) { RLH9_STEP_Y(p0, s0, q0, qe0); RLH9_STEP_Y(p1, s1, q1, qe1); }
-        while (q2 < e2 && q3 < e3) { RLH9_STEP_S(p2, s2, q2, qe2); RLH9_STEP_S(p3, s3, q3, qe3); }
-#endif
-        while (q0 < e0) RLH9_STEP_Y(p0, s0, q0, qe0);
-        while (q1 < e1) RLH9_STEP_Y(p1, s1, q1, qe1);
-        while (q2 < e2) RLH9_STEP_S(p2, s2, q2, qe2);
-        while (q3 < e3) RLH9_STEP_S(p3, s3, q3, qe3);
-#undef RLH9_STEP_S
-#undef RLH9_TBIN
-#undef RLH9_STEP_Y
-#undef RLH9_UPDATE_ST_FAST
-#undef RLH9_FAST_DECODE
-#undef RLH9_TAIL
-#undef RLH9_GET_SLOW
-#undef RLH9_HEAD
-#undef RLH9_ZERO_S
-#undef RLH9_ZERO_Y
+        while (q0 < e0 && q1 < e1 && q2 < e2 && q3 < e3) { R5_STEP_Y(p0, s0, q0, qe0); R5_STEP_Y(p1, s1, q1, qe1); R5_STEP_S(p2, s2, q2, qe2); R5_STEP_S(p3, s3, q3, qe3); }
+        while (q0 < e0 && q1 < e1) { R5_STEP_Y(p0, s0, q0, qe0); R5_STEP_Y(p1, s1, q1, qe1); }
+        while (q2 < e2 && q3 < e3) { R5_STEP_S(p2, s2, q2, qe2); R5_STEP_S(p3, s3, q3, qe3); }
+        while (q0 < e0) R5_STEP_Y(p0, s0, q0, qe0);
+        while (q1 < e1) R5_STEP_Y(p1, s1, q1, qe1);
+        while (q2 < e2) R5_STEP_S(p2, s2, q2, qe2);
+        while (q3 < e3) R5_STEP_S(p3, s3, q3, qe3);
+#undef R5_STEP_S
+#undef R5_TBIN
+#undef R5_STEP_Y
+#undef R5_TAIL
+#undef R5_HEAD
         return !bad;
     }
 

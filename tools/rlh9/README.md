@@ -1,8 +1,44 @@
-# ENGINE 9 (rlh9.hpp): RLH8 superscalar codec, format R8F4
+# ENGINE 9 (rlh9.hpp): RLH8 superscalar codec, format R8F5 (R8F4 below is history, commit 1c440de)
 
 Build: `g++ -O3 -DNDEBUG -march=native -std=c++17 -DLLRICE_ENGINE=9 -DCODER=3 bench.cpp` (signature rev '9').
 8-bit RGB only, width <= 16383. Design: Argon (rlh8f, split micro-FSM, dual tables, R8F3 geometry, 2026-11-21/22) on
-Claude's RLH8s prototype; history in the lab journal 01c. Build tag: `llrice ENGINE=9 CODER=3 FMT=R8F4 RCT=rct`.
+Claude's RLH8s prototype; history in the lab journal 01c. Build tag: `llrice ENGINE=9 CODER=3 FMT=R8F5 RCT=rct` (R8F4 files are rejected).
+
+
+## R8F5 (2026-11-23): learned 48-state context FSM, state = context
+
+Same bands, lanes, RCT, MED, alphabet and RemLUT as R8F4 below. Only the context machine changes. R8F4 keeps 768 hidden
+states (sv 48 x sr 16) and projects them to 48 contexts per group; R8F5 has exactly 48 states per group (Y, S) and set
+(photo, screen), and the state IS the context: next = R8F5_TRANS[set][group][ctx][cls], cls = (rc << 4) | vh as in R8F4.
+The decoder stores the next context in each LUT entry (lut_next, same size as the old class byte), so a token costs one
+dependent load: peek -> lut[(tc << LUTB) | bits] -> tc'. Lanes start at R8F5_INIT_CTX; EOB keeps the context.
+Tables: r8f5_best48_tables.h (R8F5_TRANS + R8F5_LEN[192][419]); RLH9_REMLEN still comes from rlh9_tables.h.
+
+T and the 192 Huffman tables are learned together by EM (cross-entropy k-means): E-step picks for each (ctx, cls) the
+next ctx minimising the cost of the following symbols under the current tables (min weight 25), M-step rebuilds the
+tables. Design and prototype: Argon (tools/rlh9/r8f5_exp.cpp, in-RAM, 2026-11-22). Full-corpus training: WorkBuddy,
+tools/rlh9/r8f5_stream.cpp (streaming counters, 1.5 GB RAM, 11 min on 4 cores): tools/rlh9/train_list.txt with the
+train_tables.sh weights, 10% of every group held out (every 10th file by name), 8 EM iterations, iteration chosen by the
+held-out bpp (8th). Checked by Claude: encoders AVX2 / SSE4.2 / -DRLH9_NO_SIMD write the same bytes and all three
+decoders return the source on 175 files (edge sizes, valid41, 12 screens, web8, Kodak); fuzz under ASan/UBSan
+(tools/rlh9/fuzz_r8f5.cpp 2 x 5000 per build, plus 500 mutations on each of 90 edge images) clean.
+
+| bpp / dec MB/s, 1 thread AVX2 | R8F4 (1c440de) | R8F5 |
+|---|---|---|
+| valid41 | 8.7799 / 308 | 8.7446 (-0.40%) / 345 |
+| Kodak | 10.2196 / 306 | 10.1921 (-0.27%) / 311-354 |
+| 12 screens | 1.2557 / 1263 | 1.2682 (+1.00%) / 1320 |
+| web8 (train) | 1.9304 / 1108 | 1.9015 (-1.50%) / 1200 |
+| 6 private iPhone screens (Claude only) | 2.0206 | 1.9305 (-4.5%) |
+
+On the 12 screens R8F5 is better or equal on 7 images; the loss is phoboslab (+3.3%) and windows95 (+2.3%): the screen
+set learned mostly from the 617 QOI game screenshots. Open: screen set retrained with more web/phone/scan screenshots
+and per-set iteration choice (photo and screen tables are independent and can be replaced separately).
+Not taken: 2-token LUT (RLH9_R8F5_2TOK, slower on AVX2 photos); R8F4 "part A" (pre-projected FSM tables, same format):
+no gain on Claude's machine. tools/rlh9/verify_r8f5_bin.cpp is Argon's two-binary verifier (needs local copies
+rlh9_1c440de_orig.hpp and rlh9_r8f5.hpp).
+
+## R8F4 (history)
 
 Format: llrice header, then per 16-row band: 4 x u32 lane byte sizes (bit 31 of the first = screen table set) + 4 lane
 byte streams: Y rows 0..m-1, Y rows m..nb-1, S rows 0..m-1, S rows m..nb-1 (m = nb / 2).
