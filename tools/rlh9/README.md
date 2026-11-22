@@ -23,13 +23,17 @@ index, a class byte per LUT entry gives the next state, zU read branch-free from
 8 rows a wave MED in SSE2 (row k at column x - k; Argon, after the PLS wave decoder) and an SSSE3 inverse RCT
 (pshufb to RGB24). -DRLH9_NO_SIMD or no SSE2: scalar, same output.
 
-Tables: `rlh9_tables.h` from `tools/rlh9/rlh9_train.cpp` (1157 images, 1648 Mpx, 1 min):
-- photo set (`-f 0`): CLIC 2020 professional train, 536 of 585 photos (the 49 held out: sorted clic-palic2
-  color/*.pln, index % 12 == 3);
-- screen set (`-f 1`): gb82 screenshots codec_wiki, gmessages, graph, gui (weight 4) + QOI suite screenshot_game
-  (617 PNG). Not trained on: the 12 classic screens (halic-wins-screen-p6) and web8 (8 tall QOI web pages; note: in the lab split
-  of Google Drive: datasets/ these 8 pages are training data, web8 as a test set is Claude's own pick).
-`SKIP=test49.txt PNG2PPM="python3 png2ppm.py" ./rlh9_train rlh9_tables.h -f 0 <clic ppm dir> -f 1 -w 4 <gb4 dir> -w 1 <qoi game dir>`
+Tables: `rlh9_tables.h` from `tools/rlh9/rlh9_train.cpp` (1214 images, 1824 Mpx), Vladimir's lab split
+(Google Drive: datasets/); the exact file names are in `tools/rlh9/train_list.txt`:
+- photo set (`-f 0`): clic2020_professional_train, all 585;
+- screen set (`-f 1`): train_gb82-sc_p6 (codec_wiki, gmessages, graph, gui; weight 4), screenshot_web without the 6 pages
+  that are in screens_full12 (amazon, apple, cnn, creativecommons, imdb, microsoft, nytimes, reddit; weight 4),
+  QOI suite screenshot_game (617 PNG; weight 1).
+Test sets, never trained on: clic2020_professional_valid (41), screens_full12_p6 (12), Kodak.
+Rebuild (reproduces the committed file byte for byte, ~2 min):
+`tools/rlh9/train_tables.sh <clic train dir> <gb82 dir> <screenshot_web dir> <screenshot_game dir> [out.h]`
+(each dir holds <stem>.ppm or <stem>.png). Lab tables vs the previous ones (536 CLIC, 4 gb82 + games):
+valid41 8.7778 -> 8.7799 bpp, 12 screens 1.2640 -> 1.2557, Kodak 10.2199 -> 10.2196.
 
 Measured (Claude's sandbox, Xeon ~3.8 GHz, 1 thread, -r 3):
 | codec | test49 photos bpp / dec MB/s | 12 screens bpp / dec | web8 bpp / dec |
