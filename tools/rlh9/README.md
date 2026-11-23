@@ -23,17 +23,25 @@ held-out bpp (8th). Checked by Claude: encoders AVX2 / SSE4.2 / -DRLH9_NO_SIMD w
 decoders return the source on 175 files (edge sizes, valid41, 12 screens, web8, Kodak); fuzz under ASan/UBSan
 (tools/rlh9/fuzz_r8f5.cpp 2 x 5000 per build, plus 500 mutations on each of 90 edge images) clean.
 
-| bpp / dec MB/s, 1 thread AVX2 | R8F4 (1c440de) | R8F5 |
-|---|---|---|
-| valid41 | 8.7799 / 308 | 8.7446 (-0.40%) / 345 |
-| Kodak | 10.2196 / 306 | 10.1921 (-0.27%) / 311-354 |
-| 12 screens | 1.2557 / 1263 | 1.2682 (+1.00%) / 1320 |
-| web8 (train) | 1.9304 / 1108 | 1.9015 (-1.50%) / 1200 |
-| 6 private iPhone screens (Claude only) | 2.0206 | 1.9305 (-4.5%) |
+| bpp / dec MB/s, 1 thread AVX2 | R8F4 (1c440de) | R8F5 7e682bd | R8F5 (screen set retrained) |
+|---|---|---|---|
+| valid41 | 8.7799 / 308 | 8.7446 / 345 | 8.7447 (-0.40%) / 332-345 |
+| Kodak | 10.2196 / 306 | 10.1921 | 10.1920 (-0.27%) / 348 |
+| 12 screens | 1.2557 / 1263 | 1.2682 (+1.00%) | 1.2510 (-0.37%) / 1236 |
+| web8 (train) | 1.9304 / 1108 | 1.9015 | 1.9012 (-1.51%) |
+| 6 private iPhone screens (Claude only) | 2.0206 | 1.9305 | 1.9248 (-4.7%) |
 
-On the 12 screens R8F5 is better or equal on 7 images; the loss is phoboslab (+3.3%) and windows95 (+2.3%): the screen
-set learned mostly from the 617 QOI game screenshots. Open: screen set retrained with more web/phone/scan screenshots
-and per-set iteration choice (photo and screen tables are independent and can be replaced separately).
+Screen set retrained (2026-11-23, WorkBuddy, tools/rlh9/r8f5_screens.cpp + r8f5_common.hpp + r8f5_build_cache.cpp):
+photo set frozen (byte-identical to 7e682bd); band set chosen by the coder's detector (force -1, ZTHR 65), photo bands
+excluded from screen statistics; no QOI games. Six groups with equal total weight (weight = 1 / group train pixels):
+screens_ios1k 700, screens_screenspot_pro 1109, screens_websight_v02_png800 560, docs_doclaynet_small 563,
+scans_dibco_2016_2019 42, web+gb82 11 (Google Drive: datasets/). Split by sorted name: i%5==4 test, else i%10==3
+held out, rest train. EM from the 7e682bd screen set, 12 iterations, 11th chosen by weighted held-out bpp; 24 min,
+195 MB RAM (token cache on disk). Test parts vs 7e682bd: ios -0.6%, desktop -0.35%, websight -2.0%, docs -1.5%,
+scans -0.3%. Screen share of bands by the detector: websight 99%, docs 97-98%, ios 91%, desktop 88%, scans 48%.
+Note: screens_ios1k is CC BY-NC (the tables are trained on it). Checked by Claude: 140 files x 3 builds byte-identical
+and lossless, fuzz_r8f5 under ASan/UBSan clean.
+
 Not taken: 2-token LUT (RLH9_R8F5_2TOK, slower on AVX2 photos); R8F4 "part A" (pre-projected FSM tables, same format):
 no gain on Claude's machine. tools/rlh9/verify_r8f5_bin.cpp is Argon's two-binary verifier (needs local copies
 rlh9_1c440de_orig.hpp and rlh9_r8f5.hpp).
