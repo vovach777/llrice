@@ -1,0 +1,51 @@
+--- a/rlh9.hpp	2026-11-23 18:19:52.402787137 +0300
++++ b/rlh9.hpp	2026-11-23 15:42:02.776923495 +0300
+@@ -982,8 +982,10 @@
+         for (int y0 = 0; y0 < H; y0 += HB) {
+             const int nb = std::min(HB, H - y0); const size_t PS = size_t(nb) * W;
+             const size_t z = fe.band(rgb, y0, nb, bu.data());
+-            const uint32_t sc = uint32_t(z * 100 >= size_t(RLH9_ZTHR) * 3 * PS);
+-            uint32_t ls[NLANE];
++            const uint32_t sc0 = uint32_t(z * 100 >= size_t(RLH9_ZTHR) * 3 * PS);
++            uint32_t ls[NLANE]; uint32_t dls[2][NLANE];
++            size_t zy = 0, zs = 0; for (size_t i = 0; i < PS; ++i) { zy += bu[i] == 0; zs += bu[3 * PS + i] == 0; }
++            for (uint32_t pass = 0; pass < 3; ++pass) { const uint32_t sc = pass < 2 ? pass : sc0;
+             for (int l = 0; l < NLANE; ++l) {
+                 int plane, r0, r1; lane_rows(l, nb, plane, r0, r1);
+                 BitW w{lb[l].data()}; uint32_t st = R8F5_INIT_CTX[sc]; const uint32_t gb = sc * SETC + uint32_t(plane) * NCTX;
+@@ -1001,6 +1003,9 @@
+                 }
+                 ls[l] = uint32_t(w.flush() - lb[l].data());
+             }
++            if (pass < 2) for (int l = 0; l < NLANE; ++l) dls[pass][l] = ls[l]; }
++            const uint32_t sc = sc0;
++            fprintf(stderr, "BAND %zu %zu %zu %zu %u %u %u %u\n", PS, z, zy, zs, dls[0][0] + dls[0][1], dls[0][2] + dls[0][3], dls[1][0] + dls[1][1], dls[1][2] + dls[1][3]);
+             if (ls[0] >= 0x80000000u) throw std::runtime_error("rlh9: band too large");
+             const size_t o = out.size(); out.resize(o + 4 * NLANE + ls[0] + ls[1] + ls[2] + ls[3]);
+             uint8_t* d = out.data() + o; const uint32_t hd[NLANE] = {ls[0] | sc << 31, ls[1], ls[2], ls[3]}; std::memcpy(d, hd, 4 * NLANE); d += 4 * NLANE;
+@@ -1013,11 +1018,13 @@
+             const int nb = std::min(HB, H - y0); const size_t PS = size_t(nb) * W;
+             uint16_t* U0 = bu.data(); uint16_t* U1 = U0 + PS; uint16_t* US = U1 + PS;
+             const size_t z = fe.band_yus(rgb, y0, nb, U0, U1, US);
+-            const uint32_t sc = uint32_t(z * 100 >= size_t(RLH9_ZTHR) * 3 * PS);
++            const uint32_t sc0 = uint32_t(z * 100 >= size_t(RLH9_ZTHR) * 3 * PS);
++            size_t zy = 0, zs = 0; for (size_t i = 0; i < PS; ++i) { zy += U0[i] == 0; zs += US[i] == 0; }
++            uint32_t dls[2][NLANE]; uint32_t ls[NLANE];
++            for (uint32_t pass = 0; pass < 3; ++pass) { const uint32_t sc = pass < 2 ? pass : sc0;
+             const uint32_t cm = ctx_m(sc), cc = ctx_c(sc);
+             const uint32_t gy = sc * SETC, gs = gy + NCTX;
+             const int m = nb / 2;
+-            uint32_t ls[NLANE];
+ #if RLH9_ENC_MODE == 2
+             // Idea 1a: 2-lane interleaved homogeneous pairs (Y0+Y1, then S0+S1)
+             if (sc) {
+@@ -1122,6 +1129,9 @@
+                 }
+             }
+ #endif
++            if (pass < 2) for (int l = 0; l < NLANE; ++l) dls[pass][l] = ls[l]; }
++            const uint32_t sc = sc0;
++            fprintf(stderr, "BAND %zu %zu %zu %zu %u %u %u %u\n", PS, z, zy, zs, dls[0][0] + dls[0][1], dls[0][2] + dls[0][3], dls[1][0] + dls[1][1], dls[1][2] + dls[1][3]);
+             if (ls[0] >= 0x80000000u) throw std::runtime_error("rlh9: band too large");
+             const size_t o = out.size(); out.resize(o + 4 * NLANE + ls[0] + ls[1] + ls[2] + ls[3]);
+             uint8_t* d = out.data() + o; const uint32_t hd[NLANE] = {ls[0] | sc << 31, ls[1], ls[2], ls[3]}; std::memcpy(d, hd, 4 * NLANE); d += 4 * NLANE;
