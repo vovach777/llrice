@@ -18,7 +18,7 @@
 #include "image.hpp"
 // LLRICE_ENGINE - the bit stream engine of the RLGR coders (compile time, like CODER):
 //   0 - the original RLGR / BitStream / PagePool classes;
-//   1 - rlgr_fast.hpp (default): lean page buffer, 4-entry page rings, Rice prefix by count-leading-ones, with the
+//   1 - rlgr_fast.hpp: lean page buffer, 4-entry page rings, Rice prefix by count-leading-ones, with the
 //       llrice reservation rule (RLGR_RESERVE64): the same files as 0 (signature rev '1');
 //   2 - lazy reservation ("holes"): only a run header is laid ahead (1 + k bits), every other code takes a page when its
 //       first bit is written, so a stream holds at most two pages: rlgr_lazy.hpp, two page slots instead of a ring;
@@ -30,12 +30,15 @@
 //       hole of the same coder even if other coders wrote after it; the size of 1/2, no pages (rev '4');
 //   5 - rlgr_bytes.hpp: every stream owns byte chunks of variable size cut from one shared byte head at the llrice
 //       reservation points; no pages, no holes, the bit position only inside the stream (rev '5').
+//   9 - rlh9.hpp: RLH8 superscalar codec R8F5 (16-row bands, 4 lanes Y/Y/S/S decoded token-interleaved, learned 48-state
+//       context FSM (state = context, next context stored in the LUT), static Huffman, photo/screen table set per band,
+//       SIMD wave MED); 8-bit RGB only (rev '9'; R8F4 is in git history, 1c440de).
 // LLRICE_FAST=0 is the old spelling of LLRICE_ENGINE=0. USE_SIMPLE_RLGR, USE_MODEL_K and USE_NEW_LINE need 0.
 #ifndef LLRICE_ENGINE
 #if (defined(LLRICE_FAST) && LLRICE_FAST == 0) || defined(USE_SIMPLE_RLGR) || defined(USE_MODEL_K) || defined(USE_NEW_LINE)
 #define LLRICE_ENGINE 0
 #else
-#define LLRICE_ENGINE 1
+#define LLRICE_ENGINE 7   // RLH7 fast: better ratio than RLGR on screens and photos, and faster
 #endif
 #endif
 #if LLRICE_ENGINE == 1 && !defined(RLGR_RESERVE64)
@@ -68,17 +71,59 @@
 #if LLRICE_ENGINE == 6
 #include "rlh.hpp"
 #endif
+#if LLRICE_ENGINE == 7
+#define RLH7_MODE 0
+#include "rlh7.hpp"
+#endif
+#if LLRICE_ENGINE == 8
+#define RLH7_MODE 1
+#include "rlh7.hpp"
+#endif
+#if LLRICE_ENGINE == 9
+#include "rlgr_fast.hpp"   // only so that the RLGR paths keep compiling; ENGINE 9 does not use them
+#include "rlh9.hpp"
+#endif
 // CODER_G_RB_SUM: r in 0..rb (rb + 1 values). TRUNC_SPLIT 1: truncated binary, k = floor(log2(rb + 1)) bits if
 // r < u = 2^(k+1) - (rb + 1), else k + 1 bits of r + u (no code is wasted). 0: bit_width(rb) bits (old format).
 #ifndef TRUNC_SPLIT
 #define TRUNC_SPLIT 1
 #endif
 //#define USE_NEW_LINE
+// LLRICE_RCT_FNBLI 1: the colour transform of fNBLI / PALIC: Y = G + ((U + V + 2) >> 2), then V -= U >> 2 (V stays -255..255).
+#ifndef LLRICE_RCT_FNBLI
+#define LLRICE_RCT_FNBLI 0
+#endif
+#define LLRICE_RCT_RND (LLRICE_RCT_FNBLI ? 2 : 0)
 namespace llrice
 {
     constexpr inline auto ext = ".llr";
     constexpr inline uint8_t rev = LLRICE_ENGINE >= 2 ? uint8_t('0' + LLRICE_ENGINE) : uint8_t('1');   // new formats: other signatures
     constexpr inline uint32_t signature = 'l' | 'l' << 8U | 'r' << 16U | rev << 24U;
+
+    // The first line of a .llr file: the program name and the build parameters that change the format, e.g.
+    // "llrice ENGINE=1 CODER=3 RCT=fnbli PRESET=screens\n". A decoder only accepts a file of its own build: the format is
+    // bound to the build while it is not stable.
+    inline std::string build_tag() {
+        std::string t = "llrice ENGINE=" + std::to_string(LLRICE_ENGINE) + " CODER=" + std::to_string(CODER);
+#if LLRICE_ENGINE == 9
+#ifndef RLH9_FMT_NAME
+#define RLH9_FMT_NAME "R8F4"
+#endif
+        t += " FMT=" RLH9_FMT_NAME; t += RLH9_RCT ? " RCT=fnbli" : " RCT=rct";
+#else
+        t += LLRICE_RCT_FNBLI ? " RCT=fnbli" : " RCT=rct";
+#endif
+#if LLRICE_ENGINE <= 5
+        t += LLRICE_RLGR_PRESET == 1 ? " PRESET=screens" : " PRESET=clic";
+#endif
+#if defined(RLGR_POOL3)
+        t += " POOL3";
+#endif
+#if TRUNC_SPLIT != 1
+        t += " TRUNC_SPLIT=" + std::to_string(TRUNC_SPLIT);
+#endif
+        return t;
+    }
 
     // stream classes per page store: PagePool -> original llrice classes, rlgrf::PageBuf / FastIn -> rlgr_fast
     template <typename Pool> struct Coders;
@@ -90,13 +135,15 @@ namespace llrice
 #endif
         using RawW = BitStream::Writer; using RawR = BitStream::Reader;
     };
-#if LLRICE_ENGINE == 1 || LLRICE_ENGINE == 2 || LLRICE_ENGINE == 6
-#if LLRICE_ENGINE == 1
+#if LLRICE_ENGINE == 1 || LLRICE_ENGINE == 2 || LLRICE_ENGINE == 6 || LLRICE_ENGINE == 7 || LLRICE_ENGINE == 8 || LLRICE_ENGINE == 9
+#if LLRICE_ENGINE == 1 || LLRICE_ENGINE == 9   // 9: the RLGR paths only have to compile
     namespace fast_ns = rlgrf;
 #elif LLRICE_ENGINE == 2
     namespace fast_ns = rlgrz;
-#else
+#elif LLRICE_ENGINE == 6
     namespace fast_ns = rlh;
+#else
+    namespace fast_ns = rlh7;
 #endif
     struct FastIn { const uint64_t* p; size_t top; size_t n; };   // decoder side: the pages and the next free one
     struct FastEnc : fast_ns::Encoder { explicit FastEnc(rlgrf::PageBuf& pb) : fast_ns::Encoder(&pb) {} };
@@ -115,6 +162,15 @@ namespace llrice
     };
     template <> struct Coders<rlgrf::PageBuf> { using Enc = FastEnc; using RawW = FastRawW; };
     template <> struct Coders<FastIn> { using Dec = FastDec; using RawR = FastRawR; };
+#if defined(RLGR_POOL3)
+    // One page pool per channel. The encoder is then free to traverse the image in any order
+    // (row-split, one encoder state live) while the decoder still interleaves the three chains
+    // and keeps three independent table lookups in flight. Costs one extra word in the file.
+    struct Pool3 { rlgrf::PageBuf* p[3]; };
+    struct In3   { FastIn* p[3]; };
+    template <> struct Coders<Pool3> { using Enc = FastEnc; using RawW = FastRawW; };
+    template <> struct Coders<In3>   { using Dec = FastDec; using RawR = FastRawR; };
+#endif
 #elif LLRICE_ENGINE == 5
     struct BytesEnc : rlgrb::Encoder { explicit BytesEnc(rlgrb::Buf& b) : rlgrb::Encoder(&b) {} };
     struct BytesDec : rlgrb::Decoder { explicit BytesDec(rlgrb::In& i) : rlgrb::Decoder(&i) {} };
@@ -236,7 +292,11 @@ void LOCO_I(Load && load, size_t width, size_t height) {
 
         using Encoder = typename Coders<Pool>::Enc;
 
+#if defined(RLGR_POOL3)
+        Encoder g_encoder(*out_pool.p[0]);
+#else
         Encoder g_encoder(out_pool);
+#endif
         #if CODER == CODER_G_RB  ||  CODER == CODER_G_RB_SUM
         Encoder rb_encoder(out_pool);
         #endif
@@ -244,8 +304,13 @@ void LOCO_I(Load && load, size_t width, size_t height) {
             typename Coders<Pool>::RawW rem_encoder(out_pool);
         #endif
         #if CODER == CODER_G_R_B
+#if defined(RLGR_POOL3)
+            Encoder r_encoder(*out_pool.p[1]);
+            Encoder b_encoder(*out_pool.p[2]);
+#else
             Encoder r_encoder(out_pool);
             Encoder b_encoder(out_pool);
+#endif
         #endif
 
 
@@ -259,9 +324,46 @@ void LOCO_I(Load && load, size_t width, size_t height) {
 
         uint32_t rem[3][16];
 
+#if defined(RLGR_ROW_SPLIT) && CODER == CODER_G_R_B
+        std::vector<uint32_t> vbuf(width);   // row-split: one channel of residuals, L1-resident
+#endif
         for (uint32_t h = 0; h < height; ++h) {
             auto& curr_line = lines[h & 1];
             auto& prev_line = lines[(h-1) & 1];
+#if defined(RLGR_ROW_SPLIT) && CODER == CODER_G_R_B
+            // ---- row-split: whole row first, then one channel at a time ----
+            // Only one encoder state is live in the token loop, so it can stay in registers.
+            // The value order inside each channel is unchanged; what changes is the order the
+            // three encoders take pages from the shared pool, so the decoder must split the same way.
+            for (uint32_t i = 0; i < width; ++i)
+                std::tie(curr_line[0][i],curr_line[1][i],curr_line[2][i]) = rgbloader();
+            for (uint32_t i = 0; i < width; ++i) {
+                curr_line[0][i] -= curr_line[1][i];
+                curr_line[2][i] -= curr_line[1][i];
+                curr_line[1][i] += (curr_line[0][i] + curr_line[2][i] + LLRICE_RCT_RND) >> 2;
+                if (LLRICE_RCT_FNBLI) curr_line[2][i] -= curr_line[0][i] >> 2;
+            }
+            #define RLGR_ROW_ENC(C, ENC)                                                          \
+            {                                                                                     \
+                const T* cl = curr_line[C]; const T* pl = prev_line[C];                            \
+                if (h == 0) {                                                                     \
+                    vbuf[0] = Rice::to_unsigned(cl[0]);                                           \
+                    for (uint32_t i = 1; i < width; ++i)                                          \
+                        vbuf[i] = Rice::to_unsigned(cl[i] - cl[i-1]);                             \
+                } else {                                                                          \
+                    const uint32_t v16 = width < 16u ? width : 16u;                               \
+                    for (uint32_t i = 0; i < v16; ++i)                                            \
+                        vbuf[i] = Rice::to_unsigned(cl[i] - pl[i]);                               \
+                    for (uint32_t i = 16; i < width; ++i)                                         \
+                        vbuf[i] = Rice::to_unsigned(cl[i] - predict(cl[i-1], pl[i], pl[i-1]));    \
+                }                                                                                 \
+                for (uint32_t i = 0; i < width; ++i) ENC.put(vbuf[i]);                            \
+            }
+            RLGR_ROW_ENC(1, g_encoder)
+            RLGR_ROW_ENC(0, r_encoder)
+            RLGR_ROW_ENC(2, b_encoder)
+            #undef RLGR_ROW_ENC
+#else
             auto width16 =width & ~0xfu;
             auto widthR  =width & 0xfu;
             for (uint32_t w = 0; w < width16; w+=16) {
@@ -272,7 +374,8 @@ void LOCO_I(Load && load, size_t width, size_t height) {
                     for (int i = 0; i <16; ++i) {
                         curr_line[0][i+w] -= curr_line[1][i+w];
                         curr_line[2][i+w] -= curr_line[1][i+w];
-                        curr_line[1][i+w] += (curr_line[0][i+w] + curr_line[2][i+w]) >> 2;
+                        curr_line[1][i+w] += (curr_line[0][i+w] + curr_line[2][i+w] + LLRICE_RCT_RND) >> 2;
+                        if (LLRICE_RCT_FNBLI) curr_line[2][i+w] -= curr_line[0][i+w] >> 2;
                     }
 
                     if (likely(w>0 && h>0)) {
@@ -343,7 +446,8 @@ void LOCO_I(Load && load, size_t width, size_t height) {
                     for (int i = 0; i < widthR; ++i) {
                         curr_line[0][i+w] -= curr_line[1][i+w];
                         curr_line[2][i+w] -= curr_line[1][i+w];
-                        curr_line[1][i+w] += (curr_line[0][i+w] + curr_line[2][i+w]) >> 2;
+                        curr_line[1][i+w] += (curr_line[0][i+w] + curr_line[2][i+w] + LLRICE_RCT_RND) >> 2;
+                        if (LLRICE_RCT_FNBLI) curr_line[2][i+w] -= curr_line[0][i+w] >> 2;
                     }
 
                     if (likely(w>0 && h>0)) {
@@ -405,6 +509,7 @@ void LOCO_I(Load && load, size_t width, size_t height) {
                         #endif
                     }
             }
+#endif
 
         #ifdef USE_NEW_LINE
             g_encoder.new_line();
@@ -441,7 +546,11 @@ void LOCO_I(Load && load, size_t width, size_t height) {
                 std::array{std::vector<T>(width),std::vector<T>(width),std::vector<T>(width)}
             };
         using Decoder = typename Coders<Pool>::Dec;
+#if defined(RLGR_POOL3)
+        Decoder g_decoder(*pool.p[0]);
+#else
         Decoder g_decoder(pool);
+#endif
         #if  CODER == CODER_G_RB || CODER == CODER_G_RB_SUM
         Decoder rb_decoder(pool);
         #endif
@@ -450,15 +559,50 @@ void LOCO_I(Load && load, size_t width, size_t height) {
         #endif
 
         #if CODER == CODER_G_R_B
+#if defined(RLGR_POOL3)
+            Decoder r_decoder(*pool.p[1]);
+            Decoder b_decoder(*pool.p[2]);
+#else
             Decoder r_decoder(pool);
             Decoder b_decoder(pool);
+#endif
         #endif
 
         uint32_t rem[3][16];
 
+#if defined(RLGR_ROW_SPLIT) && CODER == CODER_G_R_B
+        std::vector<uint32_t> vbuf(width);   // row-split: one channel of residuals, L1-resident
+#endif
         for (uint32_t h = 0; h < height; ++h) {
             auto& curr_line = lines[h & 1];
             auto& prev_line = lines[(h-1) & 1];
+#if defined(RLGR_ROW_SPLIT) && !defined(RLGR_POOL3) && CODER == CODER_G_R_B
+            // ---- row-split: mirrors the encoder, one decoder state live at a time ----
+            #define RLGR_ROW_DEC(C, DEC)                                                          \
+            {                                                                                     \
+                T* cl = curr_line[C].data(); const T* pl = prev_line[C].data();                    \
+                if (h == 0) {                                                                     \
+                    cl[0] = Rice::to_signed(DEC.get());                                           \
+                    for (uint32_t i = 1; i < width; ++i)                                          \
+                        cl[i] = Rice::to_signed(DEC.get()) + cl[i-1];                             \
+                } else {                                                                          \
+                    const uint32_t v16 = width < 16u ? width : 16u;                               \
+                    for (uint32_t i = 0; i < v16; ++i)                                            \
+                        cl[i] = Rice::to_signed(DEC.get()) + pl[i];                               \
+                    for (uint32_t i = 16; i < width; ++i)                                         \
+                        cl[i] = Rice::to_signed(DEC.get()) + predict(cl[i-1], pl[i], pl[i-1]);    \
+                }                                                                                 \
+            }
+            RLGR_ROW_DEC(1, g_decoder)
+            RLGR_ROW_DEC(0, r_decoder)
+            RLGR_ROW_DEC(2, b_decoder)
+            #undef RLGR_ROW_DEC
+            for (uint32_t i = 0; i < width; ++i) {
+                T r = curr_line[0][i], g = curr_line[1][i], b = curr_line[2][i];
+                if (LLRICE_RCT_FNBLI) b += r >> 2; g -= (r + b + LLRICE_RCT_RND) >> 2; r += g; b += g;
+                store(static_cast<UT>(r),static_cast<UT>(g),static_cast<UT>(b));
+            }
+#else
             auto width16 =width & ~0xfu;
             auto widthR  =width & 0xfu;
 
@@ -529,7 +673,8 @@ void LOCO_I(Load && load, size_t width, size_t height) {
                         T r = curr_line[0][w+i];
                         T g = curr_line[1][w+i];
                         T b = curr_line[2][w+i];
-                        g -= (r+b) >> 2;
+                        if (LLRICE_RCT_FNBLI) b += r >> 2;
+                        g -= (r + b + LLRICE_RCT_RND) >> 2;
                         r += g;
                         b += g;
                         store(static_cast<UT>(r),static_cast<UT>(g),static_cast<UT>(b));
@@ -604,12 +749,14 @@ void LOCO_I(Load && load, size_t width, size_t height) {
                         T r = curr_line[0][w+i];
                         T g = curr_line[1][w+i];
                         T b = curr_line[2][w+i];
-                        g -= (r+b) >> 2;
+                        if (LLRICE_RCT_FNBLI) b += r >> 2;
+                        g -= (r + b + LLRICE_RCT_RND) >> 2;
                         r += g;
                         b += g;
                         store(static_cast<UT>(r),static_cast<UT>(g),static_cast<UT>(b));
                     }
             }
+#endif
 
         #ifdef USE_NEW_LINE
             g_decoder.new_line();
@@ -629,8 +776,27 @@ void LOCO_I(Load && load, size_t width, size_t height) {
     inline auto compress(const RawImage& img)
     {
         Header hdr{0, img.width, img.height,static_cast<uint16_t>(1 << 15), img.channel_nb, img.bits_per_channel };
+#if defined(RLGR_POOL3)
+        hdr.flags |= uint16_t(1u << 14);   // per-channel page pools
+#endif
         hdr.protect();
-#if LLRICE_ENGINE == 5
+#if LLRICE_ENGINE == 9
+        if (img.channel_type != RawImage::ChannelType::uint8 || img.channel_nb != 3) throw std::runtime_error("ENGINE 9: 8-bit RGB only");
+        {
+            const auto body = rlh9::encode(img.as<uint8_t>(), int(hdr.width), int(hdr.height));
+            std::vector<uint64_t> out(2 + (body.size() + 7) / 8, 0);
+            std::memcpy(out.data(), &hdr, sizeof(Header));
+            if (!body.empty()) std::memcpy(out.data() + 2, body.data(), body.size());
+            return out;
+        }
+#endif
+#if defined(RLGR_POOL3)
+        rlgrf::PageBuf pg, pr, pb;
+        const size_t guess = size_t(hdr.width) * hdr.height / 24 + 1024;
+        pg.w.resize(guess); pr.w.resize(guess); pb.w.resize(guess);
+        Pool3 out_pool{ {&pg, &pr, &pb} };
+
+#elif LLRICE_ENGINE == 5
         rlgrb::Buf out_pool;                        // the header takes the first 16 bytes
         out_pool.b.resize(size_t(hdr.width) * hdr.height + 1024);   // grows on demand
         out_pool.head = sizeof(Header);
@@ -673,7 +839,15 @@ void LOCO_I(Load && load, size_t width, size_t height) {
             });
         } else
         throw std::runtime_error("Unsupported channel type");
-#if LLRICE_ENGINE == 5
+#if defined(RLGR_POOL3)
+        std::vector<uint64_t> out(3, 0);
+        std::memcpy(out.data(), &hdr, sizeof(Header));
+        out[2] = uint64_t(pg.top) | (uint64_t(pr.top) << 32);
+        out.insert(out.end(), pg.w.begin(), pg.w.begin() + pg.top);
+        out.insert(out.end(), pr.w.begin(), pr.w.begin() + pr.top);
+        out.insert(out.end(), pb.w.begin(), pb.w.begin() + pb.top);
+        return out;
+#elif LLRICE_ENGINE == 5
         std::vector<uint64_t> out((out_pool.head + 7) / 8, 0);
         std::memcpy(out.data(), out_pool.b.data(), out_pool.head);
         return out;
@@ -707,6 +881,8 @@ void LOCO_I(Load && load, size_t width, size_t height) {
         const size_t nwords = poolvec.size();
         poolvec.push_back(0); poolvec.push_back(0);  // the reader peeks two words ahead
         rlgrl::LaneR pool; pool.w = poolvec.data(); pool.nw = nwords + 2; pool.head = 128;   //пропускаем заголовок
+#elif defined(RLGR_POOL3)
+        // the three cursors are built once the header has been read
 #elif LLRICE_ENGINE
         FastIn pool{poolvec.data(), 2, poolvec.size()};   //пропускаем заголовок
 #else
@@ -730,6 +906,25 @@ void LOCO_I(Load && load, size_t width, size_t height) {
         //RawImage::ChannelType::uint16be  pnm freadly
         img.channel_type = hdr.channels_depth <= 8 ? RawImage::ChannelType::uint8 : RawImage::ChannelType::uint16be;
         img.allocate();
+#if LLRICE_ENGINE == 9
+        if (img.channel_type != RawImage::ChannelType::uint8) throw std::runtime_error("ENGINE 9: 8-bit RGB only");
+        {
+            const size_t nbody = (poolvec.size() - 2) * 8;
+            poolvec.resize(poolvec.size() + (rlh9::decode_pad(int(img.width)) + 15) / 8, 0);   // zero tail for the bit peeks
+            rlh9::decode(reinterpret_cast<const uint8_t*>(poolvec.data() + 2), nbody, img.as<uint8_t>(), int(img.width), int(img.height));
+            return img;
+        }
+#endif
+#if defined(RLGR_POOL3)
+        if (!(hdr.flags & (1u << 14))) throw std::runtime_error("not a per-channel-pool stream");
+        if (poolvec.size() < 3) throw std::runtime_error("truncated file");
+        const size_t ng = uint32_t(poolvec[2]), nr = uint32_t(poolvec[2] >> 32);
+        if (3 + ng + nr > poolvec.size()) throw std::runtime_error("truncated page table");
+        FastIn ig{poolvec.data() + 3,          0, ng};
+        FastIn ir{poolvec.data() + 3 + ng,     0, nr};
+        FastIn ib{poolvec.data() + 3 + ng + nr, 0, poolvec.size() - 3 - ng - nr};
+        In3 pool{ {&ig, &ir, &ib} };
+#endif
         auto width = img.width;
         auto height = img.height;
         if ( img.channel_type == RawImage::ChannelType::uint16 ) {

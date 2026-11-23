@@ -31,6 +31,8 @@ int main(int argc, char** argv) {
             std::cerr << "Error opening output file: " << outputFilename << std::endl;
             return 1;
         }
+        const std::string tag = llrice::build_tag() + "\n";
+        outFile.write(tag.data(), std::streamsize(tag.size()));
         outFile.write(reinterpret_cast<const char*>(compressed.data()), compressed.size()*sizeof(uint64_t));
         outFile.close();
     } catch (const std::exception& e) {

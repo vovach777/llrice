@@ -1,0 +1,57 @@
+--- a/rlh9.hpp	2026-11-23 18:19:52.402787137 +0300
++++ b/rlh9.hpp	2026-11-23 18:10:05.348924832 +0300
+@@ -102,6 +102,13 @@
+ 
+     constexpr int NV = 44, NR = 19, NSYM = NR * NV + 1, EOB = NSYM - 1, MAXL = 15;
+     constexpr int NCTX = 48, NGRP = 2, NSET = 2, SETC = NGRP * NCTX, TOTC = NSET * SETC;
++#ifdef RLH9_NOCOUNT
++#define RLH9_ZC256(acc, m) (void)0
++#define RLH9_ZC128(acc, m) (void)0
++#else
++#define RLH9_ZC256(acc, m) acc = _mm256_sub_epi16(acc, m)
++#define RLH9_ZC128(acc, m) acc = _mm_sub_epi16(acc, m)
++#endif
+ #ifndef RLH9_ZTHR
+ #define RLH9_ZTHR 65
+ #endif
+@@ -527,9 +534,9 @@
+                         _mm256_storeu_si256(reinterpret_cast<__m256i*>(U0 + x), u0);
+                         _mm256_storeu_si256(reinterpret_cast<__m256i*>(U1 + x), u1);
+                         _mm256_storeu_si256(reinterpret_cast<__m256i*>(US + x), _mm256_add_epi16(u1, u2));
+-                        zacc = _mm256_sub_epi16(zacc, _mm256_cmpeq_epi16(u0, vzero));
+-                        zacc = _mm256_sub_epi16(zacc, _mm256_cmpeq_epi16(u1, vzero));
+-                        zacc = _mm256_sub_epi16(zacc, _mm256_cmpeq_epi16(u2, vzero));
++                        RLH9_ZC256(zacc, _mm256_cmpeq_epi16(u0, vzero));
++                        RLH9_ZC256(zacc, _mm256_cmpeq_epi16(u1, vzero));
++                        RLH9_ZC256(zacc, _mm256_cmpeq_epi16(u2, vzero));
+                         if (++zblk == 8000) {
+                             alignas(32) uint16_t za[16]; _mm256_store_si256(reinterpret_cast<__m256i*>(za), zacc);
+                             for (int i = 0; i < 16; ++i) z += za[i];
+@@ -588,9 +595,9 @@
+                             _mm_storeu_si128(reinterpret_cast<__m128i*>(U0 + xh), u0);
+                             _mm_storeu_si128(reinterpret_cast<__m128i*>(U1 + xh), u1);
+                             _mm_storeu_si128(reinterpret_cast<__m128i*>(US + xh), _mm_add_epi16(u1, u2));
+-                            zacc = _mm_sub_epi16(zacc, _mm_cmpeq_epi16(u0, vzero));
+-                            zacc = _mm_sub_epi16(zacc, _mm_cmpeq_epi16(u1, vzero));
+-                            zacc = _mm_sub_epi16(zacc, _mm_cmpeq_epi16(u2, vzero));
++                            RLH9_ZC128(zacc, _mm_cmpeq_epi16(u0, vzero));
++                            RLH9_ZC128(zacc, _mm_cmpeq_epi16(u1, vzero));
++                            RLH9_ZC128(zacc, _mm_cmpeq_epi16(u2, vzero));
+                         }
+                         if (++zblk == 4000) {
+                             alignas(16) uint16_t za[8]; _mm_store_si128(reinterpret_cast<__m128i*>(za), zacc);
+@@ -1012,7 +1019,13 @@
+         for (int y0 = 0; y0 < H; y0 += HB) {
+             const int nb = std::min(HB, H - y0); const size_t PS = size_t(nb) * W;
+             uint16_t* U0 = bu.data(); uint16_t* U1 = U0 + PS; uint16_t* US = U1 + PS;
+-            const size_t z = fe.band_yus(rgb, y0, nb, U0, U1, US);
++            const size_t z0 = fe.band_yus(rgb, y0, nb, U0, U1, US);
++#ifdef RLH9_FORCE_SC
++            { static volatile size_t sink; sink = z0; }
++            const size_t z = RLH9_FORCE_SC ? 3 * PS : 0;
++#else
++            const size_t z = z0;
++#endif
+             const uint32_t sc = uint32_t(z * 100 >= size_t(RLH9_ZTHR) * 3 * PS);
+             const uint32_t cm = ctx_m(sc), cc = ctx_c(sc);
+             const uint32_t gy = sc * SETC, gs = gy + NCTX;
